@@ -28,6 +28,60 @@ clone spdlog https://github.com/gabime/spdlog.git    v1.14.1 &
 clone pupnp  https://github.com/pupnp/pupnp.git      branch-1.14.x &
 wait
 
+# ---- UxPlay（v0.6.0 AirPlay 线 / d336）：pin 57ea834 ----
+# pin 是 SHA 不是 tag，clone() 的 --depth 1 --branch 装不下 SHA ⇒ 专用全量 clone（仓库小）+ detach。
+if [ -d third_party/uxplay/.git ]; then
+  echo "[skip] uxplay 已存在" | tee -a "$LOG"
+else
+  echo "[clone] uxplay <- https://github.com/FDH2/UxPlay.git (pin:57ea834)" | tee -a "$LOG"
+  if git clone -q https://github.com/FDH2/UxPlay.git third_party/uxplay >>"$LOG" 2>&1 \
+     && git -C third_party/uxplay checkout -q --detach 57ea834 >>"$LOG" 2>&1; then
+    echo "[ok] uxplay" | tee -a "$LOG"
+  else
+    rm -rf third_party/uxplay
+    echo "[FAIL] uxplay" | tee -a "$LOG"
+  fi
+fi
+
+# ---- OpenSSL/libplist（v0.6.0 / d336）----
+# uxplay.cmake 前缀约定：third_party/vcpkg/installed/x64-windows（Windows）。
+# CI/本机均优先复用现成 vcpkg（PATH 或 VCPKG_INSTALLATION_ROOT），装完把
+# installed/x64-windows 拷进约定前缀；本机已有 third_party/vcpkg 则自动跳过。
+# Linux 走系统包（libssl-dev / libplist-dev），由 workflow「Install build deps」负责。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [ -f third_party/vcpkg/installed/x64-windows/include/openssl/ssl.h ] \
+       && [ -f third_party/vcpkg/installed/x64-windows/lib/plist-2.0.lib ]; then
+      echo "[skip] vcpkg openssl+libplist 已存在" | tee -a "$LOG"
+    else
+      VK="$(command -v vcpkg || true)"
+      [ -z "$VK" ] && [ -n "${VCPKG_INSTALLATION_ROOT:-}" ] && VK="$VCPKG_INSTALLATION_ROOT/vcpkg"
+      if [ -z "$VK" ] || [ ! -x "$VK" ]; then
+        echo "[FAIL] 找不到 vcpkg（PATH 或 VCPKG_INSTALLATION_ROOT），无法装 openssl/libplist" | tee -a "$LOG"
+      else
+        echo "[vcpkg] $VK install openssl libplist (x64-windows)" | tee -a "$LOG"
+        "$VK" install openssl:x64-windows libplist:x64-windows --no-print-usage >>"$LOG" 2>&1
+        SRCI="$(dirname "$VK")/installed/x64-windows"
+        [ -d "$SRCI" ] || SRCI="${VCPKG_INSTALLATION_ROOT:-}/installed/x64-windows"
+        if [ -f "$SRCI/include/openssl/ssl.h" ] && [ -f "$SRCI/lib/plist-2.0.lib" ]; then
+          mkdir -p third_party/vcpkg/installed/x64-windows
+          cp -r "$SRCI/include" "$SRCI/lib" "$SRCI/bin" third_party/vcpkg/installed/x64-windows/ 2>>"$LOG"
+          echo "[ok] vcpkg openssl+libplist" | tee -a "$LOG"
+        else
+          echo "[FAIL] vcpkg 装完仍缺 ssl.h/plist-2.0.lib，日志尾部：" | tee -a "$LOG"; tail -25 "$LOG"
+        fi
+      fi
+    fi
+    ;;
+  *)
+    if pkg-config --exists libplist-2.0 2>/dev/null && pkg-config --exists openssl 2>/dev/null; then
+      echo "[ok] 系统 openssl+libplist 在位" | tee -a "$LOG"
+    else
+      echo "[FAIL] 缺 libplist-dev / libssl-dev（Linux 由 workflow apt 装）" | tee -a "$LOG"
+    fi
+    ;;
+esac
+
 # glad：GL 3.3 核心加载器（pip 装生成器后离线生成）
 # d187：python 不再写死 —— 优先 FR_PYTHON，其次 PATH 上的 python/python3（CI 友好）。
 PY="${FR_PYTHON:-$(command -v python || command -v python3 || true)}"

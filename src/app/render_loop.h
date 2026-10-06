@@ -251,6 +251,14 @@ class RenderLoop {
   std::atomic<bool> force_dirty_{false};  // set_pip/set_friendly_name 等 setter 置位
   // —— v0.4.0 d56 FR_DBG_DAMAGE=3 诊断（出帧原因限频日志）——
   double last_dmg_log_ = 0;      // 上次 DMG3 日志时刻（限频 1s）
+  // ★d320：渲染泵帧成本（卡顿归因 instrumentation）—— 出帧闸门放行 → swap 的
+  //   整帧耗时与 mpv 段耗时，按秒聚合打一条。4K HEVC 高动态内容下若 avg/max
+  //   超过帧间隔（~40ms），即为显示泵过载（卡顿根源在渲染泵，不在解码）。
+  double frame_t0_ = 0.0, mpv_t0_ = 0.0;
+  double pump_total_acc_ = 0.0, pump_total_max_ = 0.0;
+  double pump_mpv_acc_ = 0.0, pump_mpv_max_ = 0.0;
+  int pump_n_ = 0;
+  double pump_log_at_ = 0.0;
   double last_draw_at_ = 0;      // 上次出帧时刻（DMG3 的 dt 分母）
 
   // —— v0.4.0 d62 → d146 R5 徽章内容基准（自举修复）——

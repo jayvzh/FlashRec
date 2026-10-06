@@ -174,6 +174,7 @@ if [ "$SKIP_BUILD" = 0 ]; then
         -DCMAKE_PREFIX_PATH="$(win_path "$PTHREADS4W_PREFIX")" \
         -DCMAKE_BUILD_TYPE=Release \
         -DFLASHREC_CONSOLE=OFF \
+        -DFR_AIRPLAY=ON \
         >/dev/null \
     || die "cmake 配置失败（上面是它的原话）"
 

@@ -5,6 +5,8 @@
   1. 编号 dN 全局连续（d1..dN），不跳号、不重号
   2. 单本台账内部编号连续
   3. INDEX.md 中每个版本的编号区间与条数，与实际条目一致
+  4. 已归档编号区间豁免（d265 翻译线归档决策）：随版本线整体归档到
+     git 分支的编号区间在主线 ledger/ 缺席属预期，不判断号、只提示
 
 用法：
     python tools/ledger_check.py       # 退出码 0 = 通过，1 = 台账损坏
@@ -24,6 +26,12 @@ SKIP = {"README.md", "INDEX.md"}
 ENTRY_RE = re.compile(r"^###\s+d(\d+)\s*[·:：\-]")
 VER_RE = re.compile(r"^v[\w.\-]+$")
 RANGE_RE = re.compile(r"^d(\d+)\s*[–\-~至]\s*d(\d+)$")
+
+# 已归档编号区间（d265 决策：版本线终止后整体归档到 git 分支，主线台账不再持有）。
+# 格式：(起始编号, 结束编号, 归档分支)。新增归档线时在此登记。
+ARCHIVED_RANGES = [
+    (229, 264, "archive/translate-line-v0.6.0"),
+]
 
 
 def parse_index() -> tuple[list[tuple[str, str, int, int, int | None, str]], list[str]]:
@@ -96,10 +104,22 @@ def main() -> int:
     nums = sorted(owners)
     if nums:
         missing = [n for n in range(1, nums[-1] + 1) if n not in owners]
-        if missing:
-            problems.append("断号：缺失 " + ", ".join(f"d{n}" for n in missing))
-        else:
-            notes.append(f"全局编号连续 d1 – d{nums[-1]}，共 {len(nums)} 条")
+        true_missing = [
+            n for n in missing
+            if not any(lo <= n <= hi for lo, hi, _ in ARCHIVED_RANGES)
+        ]
+        for lo, hi, br in ARCHIVED_RANGES:
+            in_range = [n for n in missing if lo <= n <= hi]
+            if in_range:
+                notes.append(
+                    f"d{min(in_range)}–d{max(in_range)} 属已归档区间（分支 {br}），豁免"
+                )
+        if true_missing:
+            problems.append("断号：缺失 " + ", ".join(f"d{n}" for n in true_missing))
+        if not true_missing:
+            notes.append(
+                f"主线编号连续（含归档豁免）至 d{nums[-1]}，主线持有 {len(nums)} 条"
+            )
             notes.append(f"下一个可用编号：d{nums[-1] + 1}")
 
     rows, idx_problems = parse_index()

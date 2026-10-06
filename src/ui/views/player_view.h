@@ -61,6 +61,10 @@ struct ViewInput {
   // d124：视频正走软件渲染兜底（GL 后端被判定失效时由渲染线程自动切换）。
   // 纯渲染线程每帧从 player_ 自己的真值刷新，不是跨线程输入 ⇒ 不入 input_changed 同步。
   bool sw_video = false;
+  // d310：标题栏硬/软解徽章（mpv hwdec-current，经渲染线程 2Hz 轮询缓存 media_ 填入）。
+  // ""=取不到不画不猜；"no"=软解；其余=硬解 + 后端名。同 sw_video：渲染线程本地
+  // 真值，不入 input_changed 同步；定长缓冲保住 ViewInput 的平凡可复制约束。
+  char hwdec[32] = {};
 };
 
 struct ViewCallbacks {

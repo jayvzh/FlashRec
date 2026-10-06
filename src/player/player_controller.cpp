@@ -2,12 +2,17 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>  // d285：FR_LIVE_FORMAT（起播取证台）
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <mpv/client.h>
 
 #include "app/config.h"
 #include "app/log.h"
 #include "app/str_util.h"
+#include "cast/cast_contract.h"  // d281：kLoopbackUriPrefix（回流 URI 判据，与 mpv_bridge 同源）
 
 namespace fr {
 
@@ -42,6 +47,139 @@ void PlayerController::tick(double now) {
   if (!mpv_) return;
   mpv_->pump();  // mpv 事件 → on_mpv_event → 转移（不变量 4：全程主线程）
 
+  // ★d279 端到端延迟探针（只对回环实时流）；★d283 改由 tick 驱动 —— 旧实现挂在
+  //   time-pos 属性事件上，而该事件要等 mpv 开播才发，于是「起播 7.5s」整段落在观测
+  //   盲区里，且把「mpv 就绪耗时」与「开播排队耗时」折成一个数。现在 TRANSITIONING
+  //   期间按 250ms 采样（time-pos 未到打 no-pos），起播后回落到 1s。
+  //   接收端积压 =（当前墙钟 − 这次 loadfile 墙钟）− time-pos；time-pos 的 0 点 = TS
+  //   首帧 PTS，故该值只含接收端侧（生产队列 + TCP + mpv demuxer + 解码显示），不含
+  //   客户端编码与网络。判断依据：
+  //     积压 ≈ 起播缺口且不再涨 → 起播一次性损失（追帧/提前起播可解）
+  //     积压随流长度持续爬升     → 接收端某处真积压（配合 cache-dur 细分）
+  if (live_start_wall_ > 0.0 && now >= live_probe_next_) {
+    const bool transitional = snap_.state == TransportState::Transitioning;
+    live_probe_next_ = now + (transitional ? 0.25 : 1.0);
+    const double elapsed = now - live_start_wall_;
+    const double pos = snap_.position;
+    char posbuf[32];
+    if (pos >= 0.0) snprintf(posbuf, sizeof(posbuf), "%.3f", pos);
+    else snprintf(posbuf, sizeof(posbuf), "no-pos");
+    // ★d299 断流检测：客户端断开后 `流经过`仍按墙钟走表，而 time-pos 冻住
+    //   ⇒ 「接收端积压」会线性涨到几十秒，**那是记账假象、不是延迟**（d299 定性）。
+    //   判据：apts 连续 3 次采样不动（≤0.001s）且 eof 未到 ⇒ 已无数据流入。
+    //   此时**停打积压**并明确输出「已断流」，避免后人拿它当延迟证据。
+    const double apts_now = std::atof(mpv_->get_prop("audio-pts").c_str());
+    const bool frozen_apts = live_probe_last_apts_ >= 0.0 &&
+                             std::fabs(apts_now - live_probe_last_apts_) <= 0.001;
+    live_probe_stall_ = frozen_apts ? live_probe_stall_ + 1 : 0;
+    live_probe_last_apts_ = apts_now;
+    const bool stream_dead = live_probe_stall_ >= 3 && std::string(mpv_->get_prop("eof-reached")) != "yes";
+    if (stream_dead) {
+      FR_LOG_INFO("[MPV] 延迟探针: 已断流（apts 连续 {}s 未推进，eof未到）—— 停止累计积压"
+                  "（此前的『接收端积压』是记账假象，不是延迟）", live_probe_stall_);
+      live_start_wall_ = 0.0;  // 复位，下次会话重新起算（d299）
+      return;
+    }
+    // ★d302 延迟分解：把「数据侧」与「显示侧」的差直接打出来，替代只能推算的
+    //   「接收端积压」。实测（17:37:15~17:17 三连采样）：
+    //     time-pos=163.688（冻住）demuxer-cache=166.748 接收端积压 1.480→2.486→3.489
+    //   ⇒ **数据已到 166.7s、只显示到 163.7s，正好差 3 秒且每秒涨 1 秒** ——
+    //     这就是用户观察到的「手机与播放器差好几秒」的直接来源。
+    //
+    //   三个量的含义（分工明确，不重复、不遗漏）：
+    //     已收数据位= demuxer-cache-time（demuxer 读到的**流内**位置）
+    //     显示位置   = time-pos（当前真正显示到哪）
+    //     ⇒ **数据侧延迟 = 已收数据位 − 显示位置**（要等多少秒才追得上）
+    //     ⇒ **墙钟差     = 流经过 − 已收数据位**（客户端+网络+我们自己的排队的总和）
+    //   两者相加 = 现有的「接收端积压」，但现在**每一段都能单独读**、可归因。
+    const double demux_pos = std::atof(mpv_->get_prop("demuxer-cache-time").c_str());
+    const bool has_demux = demux_pos > 0.0 && pos >= 0.0;
+    const double data_side = has_demux ? (demux_pos - pos) : -1.0;   // 数据侧延迟
+    const double wall_gap = has_demux ? (elapsed - demux_pos) : -1.0;  // 墙钟侧延迟
+    // 数据侧延迟取滑动最大值：用户感知的是「最坏的那几秒」，不是瞬时值。
+    if (data_side >= 0.0) {
+      live_data_side_ = data_side > live_data_side_ ? data_side : live_data_side_ * 0.98;
+    }
+    // ★d322→d323：追赶控制器已移出探针块（独立 200ms 采样段，见下方）——
+    //   1s 采样对追赶而言太钝（响应慢 + 档位切换粒度粗）。
+    FR_LOG_INFO("[MPV] 延迟探针: 流经过={:.3f}s time-pos={} 接收端积压={:.3f}s "
+                "demuxer-cache={} cache-dur={} core-idle={} 加载={} 开播排队={} "
+                "pause={} vfps={} vpts={} apts={} eof={} vo-delayed={} "
+                "hwdec={} 解码丢帧={} 显示丢帧={} "
+                "| ★延迟分解 数据侧={}s 墙钟侧={}s 峰值={}s",
+                elapsed, posbuf,
+                pos >= 0.0 ? elapsed - pos : elapsed, mpv_->get_prop("demuxer-cache-time"),
+                mpv_->get_prop("demuxer-cache-duration"), mpv_->get_prop("core-idle"),
+                live_loaded_wall_ > 0.0 ? "yes" : "no",
+                live_firstpos_wall_ > 0.0 ? "yes" : "no",
+                // ★d287 冻结取证四件套：真机镜像「画面静止、没有声音」时 time-pos 恒 0，
+                //   而上面几个值分不清是三种死法中的哪一种 ——
+                //   pause=yes            → 根本没播（协议面/Play 未落到 mpv）
+                //   vfps/apts 在涨而 time-pos 不动 → 帧在出但时钟没推（同步源问题）
+                //   vfps=null 且 vo-delayed 不涨   → 显示链断在 mpv 之外（渲染泵没抽帧）
+                // ★vfps=estimated-vf-fps 是「视频是否真在显示」的权威闸：只有帧被显示
+                //   后才出值。video-pts 在同一条健康会话里实测就是 (null)（离线台
+                //   23:07 复测：apts 有值、画面正常，vpts 仍空），故不能单看它。
+                mpv_->get_prop("pause"), mpv_->get_prop("estimated-vf-fps"),
+                mpv_->get_prop("video-pts"),
+                mpv_->get_prop("audio-pts"), mpv_->get_prop("eof-reached"),
+                mpv_->get_prop("vo-delayed-frame-count"),
+                // ★d319（重落地）：卡顿归因三件套——hwdec 后端 / 解码丢帧（涨=
+                // 解码跟不上）/ 显示丢帧（涨=显示跟不上），与数据洞互相独立。
+                mpv_->get_prop("hwdec-current"),
+                mpv_->get_prop("decoder-frame-drop-count"),
+                mpv_->get_prop("frame-drop-count"),
+                data_side >= 0.0 ? std::to_string(data_side).c_str() : "n/a",
+                wall_gap >= 0.0 ? std::to_string(wall_gap).c_str() : "n/a",
+                live_data_side_ > 0.0 ? std::to_string(live_data_side_).c_str() : "n/a");
+  }
+
+  // ★d323→d325：阈值细化（用户拍板数值）——触发阈值 = **缓冲垫厚度**：越低延迟
+  //   越低、抗网络抖动越弱（0.5s 级到达停顿会触底瞬停）。**非对称滞回**消边界
+  //   抖动：进入 0.6s / 退出 0.3s（200ms 采样下 B 抖动 ±0.3-0.5s，对称阈值会
+  //   在边界频繁切档）。
+  //   等级（B = 数据侧延迟 = demuxer-cache-time − time-pos；读窗 2s；★d325 首档
+  //   改 1.25×——1.1× 追动力不足，追赶期拖长）：
+  //     1.0×（未追赶）：B > 0.6s 进入 → 1.25×；B > 1.5s → 1.50×
+  //     追赶中：B ≤ 0.3s 退出 → 1.00×；0.3 < B ≤ 1.5 维持 1.25×
+  //   200ms 采样 = 追赶响应与视频帧距同量级，档位切换平滑无感。
+  if (now >= catchup_next_ && snap_.state == TransportState::Playing &&
+      snap_.source == CastSource::AirPlay &&
+      snap_.uri.rfind(cast::kLoopbackUriPrefix, 0) == 0) {
+    catchup_next_ = now + 0.2;
+    const double demux_pos = std::atof(mpv_->get_prop("demuxer-cache-time").c_str());
+    const double backlog = (demux_pos > 0.0 && snap_.position >= 0.0)
+                               ? (demux_pos - snap_.position)
+                               : 0.0;
+    constexpr double kEnterTh = 0.6;  // 进入追赶（滞回上沿）
+    constexpr double kExitTh = 0.3;   // 退出追赶（滞回下沿）
+    constexpr double kEscTh = 1.5;    // 1.25 → 1.50
+    double target;
+    if (catchup_speed_ > 1.0) {
+      // 追赶中：B ≤ 0.3s 才退出（滞回下沿）；未退出按 B 维持/升档
+      if (backlog <= kExitTh)
+        target = 1.0;
+      else if (backlog > kEscTh)
+        target = 1.5;
+      else
+        target = 1.25;
+    } else {
+      // 1.0×：B > 0.6s 进入追赶（先 1.25×，升档由后续采样按 B 升）
+      if (backlog > kEscTh)
+        target = 1.5;
+      else if (backlog > kEnterTh)
+        target = 1.25;
+      else
+        target = 1.0;
+    }
+    if (target != catchup_speed_) {
+      mpv_->set_speed(target);
+      FR_LOG_INFO("[MPV] 追赶控制器: 积压 {:.2f}s → 倍速 {:.2f}x{}", backlog,
+                  target, target > catchup_speed_ ? "（追赶）" : "（已追平）");
+      catchup_speed_ = target;
+    }
+  }
+
   // d151：GL→SW 降级后按位重载续播（渲染线程刚切的上下文拿不到帧，必须重载；
   // 且 hwdec=no 只对后续 loadfile 生效）。放在 pump 之后：先消化既有事件，再发起重载。
   reload_after_backend_switch();
@@ -50,6 +188,9 @@ void PlayerController::tick(double now) {
   if (snap_.state == TransportState::Transitioning && transition_at_ > 0 &&
       now - transition_at_ > 15.0) {
     FR_LOG_ERROR("[DMR] [req#-] TRANSITIONING 超 15s，强制 STOPPED（防卡死）");
+    // d273：强停前抓 mpv 诊断快照——流是否到达 mpv（filename/缓存）、轨是否建出
+    //（track-list）、解码器是否认出编码（video-format/audio-codec）。黑屏无声排障关键。
+    FR_LOG_ERROR("[DMR] mpv 诊断快照: {}", mpv_->diag_snapshot());
     enter_stopped("transition-timeout", -1);
   }
 
@@ -76,7 +217,41 @@ void PlayerController::tick(double now) {
     clear_session("retention-expired");
   }
 
+  // ★d281：镜像自适应填充（只对回环镜像流；0.5s 轮询视频比例）。实测背景：
+  //   iPhone 横屏镜像 = 1920x884（19.5:9），舞台 = 1920x1146（1.675）。
+  //   contain ⇒ 按宽填满 + 上下 131px letterbox（用皮肤底色画）；而源视频左右
+  //   还自带手机播放器烧录的纯黑边（截图实测 RGB(0,0,0)，左右各 175px）
+  //   ⇒ 观感"四边皆不满"。改 cover ⇒ 裁掉两侧，最先裁掉的就是那些烧录黑边，
+  //   16:9 真内容铺满整个舞台。
+  //   竖屏镜像（498x1080 = 0.461）反过来：contain 恰好上下满、整屏不丢；cover 会把
+  //   手机屏幕裁掉大半 —— 所以判决取"谁宽听谁"，不是无脑 cover。
+  // 只在**判决变化**时下发 panscan，避免反复 reconfigure 抖动。
+  if (fit_auto_ && stage_aspect_ > 0.01 && now >= fit_probe_next_) {
+    fit_probe_next_ = now + 0.5;
+    const double va = mpv_->video_aspect();
+    if (va > 0.0) {
+      // 阈值 0.5%：近平局时取 cover —— 此时两侧裁切量极小，且优先消灭源内黑边。
+      const double want = (va >= stage_aspect_ * 0.995) ? 1.0 : 0.0;
+      if (want != fit_applied_) {
+        fit_applied_ = want;
+        mpv_->set_panscan(want);
+        FR_LOG_INFO("[MPV] 镜像填充自适应: 视频比例={:.3f} 舞台比例={:.3f} → {}", va,
+                    stage_aspect_, want >= 0.5 ? "cover（铺满，裁两侧）" : "contain（保整屏，上下满）");
+      }
+    }
+  }
+
   publish_position(false);  // 1s 节流的位置事件
+}
+
+// ★d281：镜像自适应填充判据 —— 舞台宽高比由主循环推送（窗口逻辑尺寸；顶栏可见时排除）。
+// 只记录并让下一轮 tick 立刻重判；比例不变（同一窗口）时不触发任何动作。
+void PlayerController::set_stage_aspect(double aspect) {
+  if (aspect <= 0.01) return;
+  if (std::fabs(aspect - stage_aspect_) > 0.001) {
+    stage_aspect_ = aspect;
+    fit_probe_next_ = 0.0;  // 舞台变了（缩放/全屏）→ 立即重判一次
+  }
 }
 
 void PlayerController::render_frame(int fbo, int w, int h) {
@@ -127,6 +302,20 @@ void PlayerController::set_panscan(double p) {
   if (mpv_) mpv_->set_panscan(p);
 }
 
+// ★d295：切皮肤后恢复自适应填充的判决。
+//   病灶：`main.cpp` 切皮肤时无条件 `set_panscan(皮肤 stageCover)`，把 d281 已下发的
+//   「按比例自适应」判决覆盖掉。真机实测（16:24:03切 ubuntu-orange）：
+//     panscan 1 → 0，render 日志由 `(75,0) 1770x884 -> (0,0) 960x480`
+//     （裁两侧、上下铺满）退回 `(0,0) 1920x884 -> (0,19) 960x442`（留边、上下黑边）。
+//   ⇒ 自适应期间（fit_auto_）**不动 panscan**；把 fit_applied_ 复位让下一轮 tick 重判即可
+//   （tick 每 0.5s 重判一次，舞台比例在切皮肤后可能也变了）。
+void PlayerController::restore_fit_after_skin_change() {
+  if (!fit_auto_) return;  // 非镜像自适应会话：panscan 归皮肤管，main.cpp照旧下发
+  fit_applied_ = -1.0;    // 复位 → 下一轮 tick 用新皮肤下的舞台比例重判
+  fit_probe_next_ = 0.0;
+  FR_LOG_INFO("[MPV] 切皮肤：自适应填充生效中，保留 panscan（下一轮重判）");
+}
+
 void PlayerController::set_background_color(const std::string& rgb_hex) {
   if (mpv_) mpv_->set_background_color(rgb_hex);
 }
@@ -170,6 +359,8 @@ void PlayerController::enter_stopped(const char* why, int req_id) {
   seek_pending_ = -1;
   reconnect_left_ = 0;
   reconnect_uri_.clear();
+  fit_auto_ = false;   // d281：会话结束，填充策略回到皮肤 fit
+  fit_applied_ = -1.0;
   mpv_->set_pause(true);  // 停止后 mpv 静默挂起，保持最后画面 2s（R5）
   apply_state(TransportState::Stopped, why, req_id);
   publish_media();
@@ -224,7 +415,12 @@ void PlayerController::handle_set_uri(const DmrCommand& c, double now) {
   stop_at_ = 0;
   snap_.uri = c.uri;
   snap_.metadata = c.metadata;
-  snap_.title = extract_dc_title(c.metadata);
+  // d310：来源徽章真值 —— 此前漏拷 c.source，snap_.source 恒为默认 Dlna，
+  // AirPlay 会话在 UI 侧永远显示不出「AirPlay 投屏」（AIRPLAY_EMBED_PLAN.md:172 M2 接线）。
+  snap_.source = c.source;
+  // d310：会话名 —— event_bus.h 设计口径：AirPlay 会话名走 c.title（客户端名 /"AirPlay 镜像"），
+  // DIDL 提取只归 DLNA 路径；此前无条件 extract_dc_title ⇒ AirPlay 标题恒为空。
+  snap_.title = c.title.empty() ? extract_dc_title(c.metadata) : c.title;
   snap_.next_uri.clear();
   snap_.next_metadata.clear();
   snap_.position = 0;
@@ -243,7 +439,48 @@ void PlayerController::handle_set_uri(const DmrCommand& c, double now) {
   bus_.publish_cast({c.uri, false});
   apply_state(TransportState::Transitioning, "set-uri", c.req_id);
   transition_at_ = now;
-  mpv_->load_uri(c.uri);
+  // ★d285 起播取证台：FR_LIVE_FORMAT=mpegts 时，把**回环 URI**（tcp://127.0.0.1:）也按
+  //   「回流实时流」加载 —— 于是 `ts_feed.py 喂切片 + 生产 player（libmpv render+GL）`
+  //   能在**无手机**条件下复现并度量 AirPlay 的起播门（A 段）。
+  //   动机：离线裸 libmpv（vo=null）已实测复现不出起播空档（A=0.01s vs 真机 1.6~7.6s），
+  //   而每个假设都消耗一次真机投屏太贵。★只认回环前缀 ⇒ DLNA 的 http:// 直链零影响；
+  //   默认不设 = 行为与今天完全一致。纯诊断通道。
+  std::string live_fmt = c.load_format;
+  if (live_fmt.empty() && c.uri.rfind(cast::kLoopbackUriPrefix, 0) == 0) {
+    if (const char* lf = std::getenv("FR_LIVE_FORMAT"); lf != nullptr && *lf != '\0') {
+      live_fmt = lf;
+      FR_LOG_WARN("[MPV] FR_LIVE_FORMAT={} → 回环 URI 按实时流加载（取证台）", live_fmt);
+    }
+  }
+  mpv_->load_uri(c.uri, -1.0, live_fmt);
+  live_format_ = live_fmt;  // ★d312：暂存回环加载格式，暂停恢复跳前沿时复用
+  // ★d322：新会话恢复**用户倍速**（d169 档位）——AirPlay 追赶控制器可能把 mpv
+  //   speed 改写在 1.0~1.5 之间，切换到 DLNA（或新会话）时必须还原，否则点播
+  //   会以追赶倍速播放。DLNA 会话恢复 d169 用户档位；AirPlay 会话从 1.0 由
+  //   控制器接管（控制器仅在回环 Playing 期驱动，此处归零其状态基准）。
+  mpv_->set_speed(snap_.speed);
+  catchup_speed_ = 1.0;
+  // ★d279 端到端延迟探针锚点：load_format 非空 = AirPlay 回流（DLNA 点播不设，
+  //   与 mpv_bridge.cpp 的 P1 低延迟选项门控同一判据）。用 mono_now() 取值，
+  //   与 on_property 里的采样点**同一时钟**，不依赖 tick 参数来源。
+  if (!live_fmt.empty()) {
+    live_start_wall_ = mono_now();
+    live_probe_next_ = live_start_wall_;  // ★d283：立刻起测（旧值 +3.0 会把起播过程整段糊掉）
+    live_loaded_wall_ = -1.0;
+    live_firstpos_wall_ = -1.0;
+  } else {
+    live_start_wall_ = -1.0;  // DLNA：关掉探针
+    live_loaded_wall_ = -1.0;
+    live_firstpos_wall_ = -1.0;
+  }
+  // ★d281：填充策略分流。回环 URI（tcp://127.0.0.1:）= AirPlay 镜像/音频回流 →
+  //   走「按比例自适应」（判据见 tick）：这类流的形状 = **手机屏幕形状**，源内还可能
+  //   自带播放器烧录的黑边，不能只按皮肤 fit 死办。DLNA 直链与 AirPlay 的 HLS 直载
+  //   （location 直给 mpv）仍按皮肤 fit —— 电影 2.39:1 被 cover 会裁掉约三成画面。
+  //   前缀常量与 mpv_bridge（回流 URI 不进 last_uri_）同源，见 cast_contract.h。
+  fit_auto_ = base.rfind(cast::kLoopbackUriPrefix, 0) == 0;
+  fit_applied_ = -1.0;   // 本会话尚未判定 → 下一轮 tick 首次取样
+  fit_probe_next_ = 0.0;
   FR_LOG_INFO("[DMR] [req#{}] SetURI {} title=\"{}\"", c.req_id, uri_without_fragment(c.uri),
               snap_.title);
   // ★d143：DIDL 原文落盘（受 log.trace_http_body 控制）。起始进度的候选载体之一就藏在
@@ -270,13 +507,30 @@ void PlayerController::handle_play(const DmrCommand& c, double now) {
     return;
   }
   if (snap_.state == S::Ready || snap_.state == S::PausedPlayback) {
-    mpv_->set_pause(false);
-    apply_state(S::Playing, "play", c.req_id);
+    // ★d312：AirPlay 直播回流的暂停恢复必须**跳直播前沿**——重载回环 URI = 新建连接
+    //   从当前数据解复用，天然落在直播前沿。原地 set_pause(false) 只会从暂停时刻的
+    //   旧画面播起：暂停期内容已流逝，用户实测延迟可达分钟级（「手机上几分钟前播过
+    //   的画面，投屏上几分钟后才显示」）。DLNA URL 播放流保持原地继续（点播语义，
+    //   用户明确要求区分两者）。跳转走 TRANSITIONING，file-loaded(auto-play) 自动续播。
+    if (snap_.uri.rfind(cast::kLoopbackUriPrefix, 0) == 0) {
+      mpv_->load_uri(snap_.uri, -1.0, live_format_);
+      apply_state(S::Transitioning, "play-live-edge", c.req_id);
+      transition_at_ = now;
+    } else {
+      mpv_->set_pause(false);
+      apply_state(S::Playing, "play", c.req_id);
+    }
   } else if (snap_.state == S::Playing) {
     mpv_->set_pause(false);  // 幂等
   } else if (snap_.state == S::Stopped && snap_.has_session) {
-    // 保持期内 Play：重推当前 URI 继续（部分 App 行为）
-    mpv_->load_uri(snap_.uri, snap_.position);
+    // R5 保持期内 Play：重推当前 URI 继续（部分 App 行为）
+    // ★d312：直播回流同样跳直播前沿（旧位置对直播无意义——seekable=no、内容已流逝，
+    //   按冻结 position 重推 = 从过去起播）；DLNA 点播仍按 snap_.position 续播。
+    if (snap_.uri.rfind(cast::kLoopbackUriPrefix, 0) == 0) {
+      mpv_->load_uri(snap_.uri, -1.0, live_format_);
+    } else {
+      mpv_->load_uri(snap_.uri, snap_.position);
+    }
     apply_state(S::Transitioning, "play-after-stop", c.req_id);
     transition_at_ = now;
   } else {
@@ -290,6 +544,13 @@ void PlayerController::handle_pause(const DmrCommand& c, double now) {
   if (snap_.state == S::Transitioning) {
     pending_.push_back(c);
     FR_LOG_DEBUG("[DMR] [req#{}] Pause 在 TRANSITIONING 期入队", c.req_id);
+    return;
+  }
+  // ★d318：AirPlay 镜像为直播流（中途不发关键帧，ts_dump 65.3s 仅首帧 1 个
+  //   IDR）⇒ 不支持暂停——UI 按钮已禁用，此处兜底键盘/媒体键等其它路径。
+  //   DLNA URL 播放流不受影响（点播语义，真暂停）。
+  if (snap_.source == CastSource::AirPlay && snap_.state == S::Playing) {
+    FR_LOG_INFO("[DMR] [req#{}] Pause 忽略（AirPlay 直播流不支持暂停）", c.req_id);
     return;
   }
   if (snap_.state == S::Playing) {
@@ -383,6 +644,14 @@ void PlayerController::handle_mute(const DmrCommand& c, double now) {
 }
 
 void PlayerController::handle_speed(const DmrCommand& c, double now) {
+  // ★d322：AirPlay 会话的用户倍速由追赶控制器接管（UI 按钮已禁用，此处兜底
+  //   DLNA 控制器命令等路径）。DLNA 会话不受影响。
+  if (snap_.source == CastSource::AirPlay &&
+      snap_.uri.rfind(cast::kLoopbackUriPrefix, 0) == 0) {
+    FR_LOG_INFO("[DMR] [req#{}] SetSpeed {:.2f}x 忽略（AirPlay 倍速由追赶控制器接管）",
+                c.req_id, c.speed);
+    return;
+  }
   // d169：本地倍速（控制栏选择）。夹到 [0.25, 4.0]；倍速是 mpv 全局属性，
   // 跨 loadfile / 后端重载保持，无需在文件加载后重设。
   double s = c.speed;
@@ -426,6 +695,12 @@ void PlayerController::run_pending_after_load() {
 }
 
 void PlayerController::on_file_loaded(double now) {
+  // ★d283 判决 A 段：mpv 从 loadfile 到 file-loaded 花了多久（回环流才有值）。
+  if (live_start_wall_ > 0.0 && live_loaded_wall_ < 0.0) {
+    live_loaded_wall_ = mono_now();
+    FR_LOG_INFO("[MPV] 起播取证 A 段: loadfile→file-loaded={:.3f}s（demuxer 就绪）",
+                live_loaded_wall_ - live_start_wall_);
+  }
   // R6：isLive 判定 —— seekable=no 或 duration<=0
   double dur = mpv_->get_duration();
   bool seekable = mpv_->get_seekable();
@@ -443,10 +718,23 @@ void PlayerController::on_file_loaded(double now) {
     reconnect_uri_.clear();
     reconnect_left_ = 0;
   }
+  // ★d301 修「只显示第一帧然后卡死」：开播时把 **mpv 实际状态与状态机对齐**。
+  //   病灶（本条是真机首现，v0.1.0 起就存在）：`loadfile` **不重置 mpv 的 pause 属性**
+  //   （mpv_bridge.cpp:458 的注释已写明这一点），而 `stop()` / `clear_session()` 会
+  //   `set_pause(true)`（保持最后画面，见 R5）。⇒ **同一进程内第二次投屏**时，
+  //   新会话带着上一会话遗留的 `pause=true` 开播：状态机已是 PLAYING、mpv 却仍暂停
+  //   ⇒ 不读回环 ⇒ 只显示首帧后卡死 + 数据面 `mux消费+0 / TS输出+0包 / 队列丢v/a` 暴涨。
+  //   触发条件：**App 复用会话**（先发 Stop 再 SetURI）。此前用 iPhone17,1 每次都是
+  //   全新会话，故从未踩到；换 iPhone15,4 后 App 复用了会话，立刻暴露。
+  //   ⇒ 判据：`next == Playing` 时必须显式解除暂停。
+  if (next == TransportState::Playing) mpv_->set_pause(false);
   apply_state(next, auto_play ? "file-loaded(auto-play)" : "file-loaded", -1);
   publish_media();
   FR_LOG_INFO("[DMR] [req#-] file-loaded：isLive={} dur={} title=\"{}\"", snap_.is_live, dur,
               snap_.title);
+  // d273：file-loaded 即抓一次轨/编码快照——回流裸流「加载成功但没建出视频轨」
+  //（TS 里视频 PES 缺失/坏）在这条日志一眼可辨。
+  FR_LOG_INFO("[DMR] mpv 轨信息: {}", mpv_->diag_snapshot());
   run_pending_after_load();
   (void)now;
 }
@@ -501,6 +789,15 @@ void PlayerController::on_end_file(int reason, double now) {
 
 void PlayerController::on_property(const MpvEvent& e, double now) {
   if (e.prop_name == "time-pos") {
+    // ★d283 判决 B 段：首个有效 time-pos = mpv 真正开始推进播放位置的时刻。
+    //   与 A 段（file-loaded）之差 = 主线程 auto-play 冲队/开播握手耗时。
+    if (live_start_wall_ > 0.0 && live_firstpos_wall_ < 0.0 && e.num >= 0.0) {
+      live_firstpos_wall_ = mono_now();
+      FR_LOG_INFO("[MPV] 起播取证 B 段: file-loaded→首个 time-pos={:.3f}s，"
+                  "loadfile→time-pos 合计={:.3f}s（旧探针量到的就是这个合计）",
+                  live_firstpos_wall_ - (live_loaded_wall_ > 0.0 ? live_loaded_wall_ : live_start_wall_),
+                  live_firstpos_wall_ - live_start_wall_);
+    }
     // R3：seek 期间不刷位置缓存（等 seeking=false 确认），否则进度条来回弹
     if (seek_pending_ >= 0) return;
     snap_.position = e.num;

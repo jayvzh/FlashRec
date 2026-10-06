@@ -1,5 +1,7 @@
 #include "player/mpv_bridge.h"
 
+#include "cast/cast_contract.h"  // d269：kLoopbackUriPrefix（回流 URI 不进 last_uri_）
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -34,13 +36,27 @@ bool MpvBridge::init() {
   mpv_set_option_string(mpv_, "osc", "no");
   mpv_set_option_string(mpv_, "audio-display", "no");
   mpv_set_option_string(mpv_, "demuxer-max-bytes", "64MiB");
+  // ★d283 取证开关：真机 loadfile→file-loaded 空档 7.577s，期间主线程正常 tick、
+  //   mpv 只读到流时间 0.267s —— 离线 vo=null 复现不出（同选项 0.01s 就绪），
+  //   只能让 mpv 自己把这段时间讲了。FR_MPV_TRACE=1 抬 msg-level 并放开日志级别。
+  //   纯诊断，不改任何播放行为；默认关。
+  const bool mpv_trace = [] {
+    const char* v = std::getenv("FR_MPV_TRACE");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  if (mpv_trace)
+    mpv_set_option_string(mpv_, "msg-level", "cplayer=v,demux=v,demux_lavf=v,ffmpeg=v,stream=v");
   if (mpv_initialize(mpv_) < 0) {
     FR_LOG_ERROR("[MPV] mpv_initialize 失败");
     mpv_terminate_destroy(mpv_);
     mpv_ = nullptr;
     return false;
   }
-  mpv_request_log_messages(mpv_, "info");
+  mpv_request_log_messages(mpv_, mpv_trace ? "v" : "info");
+  if (mpv_trace) {
+    log_trace_ = true;  // d287：真正打通 —— 否则 v 级请求来了也被这里的分级丢弃
+    FR_LOG_WARN("[MPV] FR_MPV_TRACE 已开：mpv 内部日志按 v 级转发");
+  }
   // d125：配置开关 —— 强制软件渲染，完全不碰视频 GL 链。
   // 用途：① 老显卡驱动（已知会闪退/白屏）的自救开关；② 启动探测结论的落地通道。
   // 取值：FR_FORCE_SW=1/true/yes 生效；未设或 0 不生效。
@@ -226,7 +242,10 @@ void MpvBridge::pump() {
             // 两道兜底（SEH + 特征串）都没触发就成了盲区。render 模块全量落 INFO，
             // 其它模块只落 warn/error，避免 demuxer/decoder 的 info 刷屏。
             const bool is_render_mod = m->prefix && strncmp(m->prefix, "libmpv_render", 14) == 0;
-            if (is_render_mod)
+            if (log_trace_ && m->log_level > MPV_LOG_LEVEL_WARN) {
+              // ★d287：取证通道专用 —— WARN 以上仍走下面的原分级，避免把错误降级成 info。
+              FR_LOG_INFO("[MPV][{}] {}", m->prefix ? m->prefix : "?", line);
+            } else if (is_render_mod)
               FR_LOG_INFO("[MPV][{}] {}", m->prefix ? m->prefix : "?", line);
             else if (m->log_level <= MPV_LOG_LEVEL_WARN)
               FR_LOG_WARN("[MPV][{}] {}", m->prefix ? m->prefix : "?", line);
@@ -274,8 +293,66 @@ void MpvBridge::pump() {
   }
 }
 
-void MpvBridge::load_uri(const std::string& uri, double start_sec) {
-  if (!mpv_) return;
+// d273：诊断快照（强停/异常时由 player_controller 落日志）
+std::string MpvBridge::diag_snapshot() {
+  if (!mpv_) return "(mpv 未初始化)";
+  static const char* keys[] = {
+      "filename",
+      "seekable",
+      "duration",
+      "eof-reached",
+      "core-idle",
+      "pause",              // d287：冻结取证（yes=压根没播）
+      "estimated-vf-fps",   // d287：视频是否真在显示（无帧可显示时取不到值）
+      "video-pts",          // d287：显示链是否真在出帧
+      "audio-pts",          // d287：音频时钟（无声缺陷的分界）
+      "video-format",
+      "width",
+      "height",
+      "video-codec",
+      "video-bitrate",
+      "audio-codec-name",
+      "audio-params/samplerate",
+      "audio-bitrate",
+      "track-list",
+      "demuxer-cache-time",
+      "demuxer-cache-duration",
+      "paused-for-cache",
+      "cache-buffering-state",
+  };
+  std::string out;
+  for (const char* k : keys) {
+    char* v = mpv_get_property_string(mpv_, k);
+    out += k;
+    out += "=";
+    out += (v && *v) ? v : "(null)";
+    if (v) mpv_free(v);
+    if (std::strcmp(k, "track-list") == 0) out += "\n  ";  // JSON 较长，换行
+    else out += "  ";
+  }
+  return out;
+}
+
+// d279：单个属性取值（字符串形式），探针用。
+std::string MpvBridge::get_prop(const char* name) {
+  if (!mpv_ || !name) return "(null)";
+  char* v = mpv_get_property_string(mpv_, name);
+  std::string out = (v && *v) ? v : "(null)";
+  if (v) mpv_free(v);
+  return out;
+}
+
+// d281：视频显示宽高比（含 PAR 修正）。取不到/无视频/离谱值一律 0 —— 判定侧据此跳过。
+// 为什么不用 demux-w/h：那是**解码尺寸**，镜像流常见 SAR≠1，必须看显示比例。
+double MpvBridge::video_aspect() {
+  if (!mpv_) return 0.0;
+  double a = 0.0;
+  if (mpv_get_property(mpv_, "video-params/aspect", MPV_FORMAT_DOUBLE, &a) < 0) return 0.0;
+  return (a > 0.01 && a < 100.0) ? a : 0.0;
+}
+
+void MpvBridge::load_uri(const std::string& uri, double start_sec,
+                         const std::string& load_format) {  if (!mpv_) return;
   // d184：每次加载应用视频填充（cover=1/contain=0；等价 CSS object-fit）
   mpv_set_property(mpv_, "panscan", MPV_FORMAT_DOUBLE, &panscan_);
   // d196：留边底色随皮肤（contain 时 letterbox 用 stageBg，而非 mpv 默认黑）
@@ -284,12 +361,76 @@ void MpvBridge::load_uri(const std::string& uri, double start_sec) {
   std::string clean = uri_without_fragment(uri);
   double start = start_sec;
   if (start < 0) start = uri_start_fragment(uri);  // R1：#t=xx 进度载体
+  // d269：AirPlay 回流裸流按 load_format 钉 demuxer（"latm"/"caf"/"mpegts"；
+  // 空 = 自动探测）。用 per-loadfile option，无属性残留，不影响 DLNA 播放。
   std::vector<std::string> cmd = {"loadfile", clean, "replace"};
   std::string opts;
   if (start > 0.0) {
     char buf[40];
     snprintf(buf, sizeof(buf), "start=%.3f", start);
     opts = buf;
+  }
+  // ★d279：回流实时流必须走**低延迟**选项集（只加在 load_format 非空时 —— 已核实
+  //   全工程只有 AirPlay 回流设它：airplay_stream.cpp 的 "mpegts"/"latm"/"caf"/"aac"，
+  //   DLNA 点播不设，故 mpv_bridge.cpp:38 的全局 demuxer-max-bytes=64MiB 对 DLNA 仍生效）。
+  //   取证（d279 受控实验，真机 dump 切片按实时速率喂 + 量 demuxer-cache-duration
+  //   = 已读前沿 PTS − 播放位置 PTS = 端到端延迟）：
+  //     生产基线（全局 64MiB）：10.5s → **38.4s 仍在爬**（终点 ~123s）
+  //     cache=no                       ：1.00s（被 demuxer-readahead-secs 默认 1s 卡住）
+  //     cache=no,demuxer-readahead-secs=0.1：**0.10s**（实测线性可控）
+  //   机理：mpv 把 tcp://127.0.0.1 当网络流 ⇒ cache=auto ⇒ 读游标全速跑到播放位置
+  //   前面 demuxer-max-bytes 那么多字节 —— 实时流下这段预读量就是纯延迟。
+  //   ★per-file 生效性已实测（同一 mpv、同一 URI，仅 per-file 不同，行为迥异）。
+  // ★d279c：起播耗时才是延迟的**主项**（P1 只治了稳态缓冲，治不了这个）。
+  //   真机探针（player_controller 的「延迟探针」）实测：接收端积压恒定 4.35s
+  //   （= 流经过 − time-pos），且**生产积压 = −0.01s、demuxer 缓存 = 0.100s** ⇒
+  //   积压既不在生产侧也不在 demuxer 缓存，而在「mpv 起播慢」：
+  //     20:04:15.084 loadfile → 20:04:18.994 file-loaded（**3.91s**），
+  //     起播那一刻 time-pos 仅 0.05s ⇒ mpv 从 PTS=0 起播却晚了 3.9s，
+  //     之后以实时速率播放（追不上），于是永久落后 3.9s。
+  //   受控实验（build/test_ts/startup_test.sh，离线重放真机切片）：
+  //     现状（cache=no,readahead=0.1）           → 起播 ~3.8s（与真机 3.91s 吻合）
+  //     +probesize=200000,analyzeduration=1     → 起播 **<0.5s**
+  //   机理：lavf demuxer 默认 probesize=5MB / analyzeduration=5s，网络实时流下
+  //   要收满这么多数据才肯 file-loaded —— 在 ~10Mbps 镜像上就是 4s 的死等。
+  //   我们的格式是已知的（mpegts/latm/caf/aac，见 load_format），无需大探测。
+  //   audio-buffer=0.1：默认 0.2s 的音频输出缓冲同样计入端到端延迟。
+  // ★d285：200000 这一档**本身又是新的门**，必须再砍一个小数量级。
+  //   真机 A 段（loadfile→file-loaded）实测 7.577s；离线用**生产播放器**（tools/live_bench.py
+  //   + FR_LIVE_FORMAT=mpegts，真机抓的 d282_live.ts 按可控码率回喂）同流同选项 A/B：
+  //     喂速 0.29MB/s + probesize=200000 → A=1.086s
+  //     喂速 0.042MB/s + probesize=200000 → A=7.456s / 7.687s（两次复现）
+  //     喂速 0.042MB/s + probesize=16384  → A=0.064s
+  //     喂速 0.29MB/s  + probesize=16384  → A=0.231s，B=0.271s，轨道表 video/audio **仍在**
+  //   ⇒ A ∝ probesize / 喂速：这就是**字节闸门**，不是时间闸门。镜像起始常落在近乎
+  //   静止的画面上（iPhone 只发稀疏 P 片，~42KB/s），200000B 就要 5s+；而 mpv 起播后
+  //   按实时速率走 ⇒ 永远追不回，这 7.5s 直接变成用户看到的「10s+ 延迟」的主项。
+  //   16384 ≈ 87 个 TS 包，覆盖 3~4 个 PSI 周期（PAT/PMT 100ms 重发，d282）足以建轨。
+  //   ★顺带否证两条候选（d283 留档）：①「主线程被卡」—— 取证期间主循环 tick 日志间隔
+  //   正常；②「PMT 声明了空音频 ES 卡住探测」—— A 段里轨道表已建好，空 ES 是**另一个**
+  //   缺陷（file-loaded 后 time-pos 恒 0 + core-idle 空转），与本门无关，另行处置。
+  if (!load_format.empty()) {
+    if (!opts.empty()) opts += ",";
+    opts += "demuxer-lavf-format=" + load_format;
+    // ★d322：readahead 0.1 → 2.0 —— 追赶控制器（player_controller）的**缓冲深度**
+    //   配套。0.1s 窗口下 mpv 手里没有可加速消费的积压（积压滞留在我们的发送
+    //   缓冲/网络侧），倍速控制器无从追起；2.0s 窗口让积压进入 mpv demuxer，
+    //   控制器以倍速把延迟压回阈值。稳态延迟 ~1-2s（控制器压制），换取突发
+    //   不丢片、解码链不断。d279 的 0.1s 是「无控制器时代」的取舍，本条是
+    //   有控制器后的重新取舍。
+    opts += ",cache=no,demuxer-readahead-secs=2.0";
+    opts += ",demuxer-lavf-probesize=16384,demuxer-lavf-analyzeduration=1";
+    opts += ",audio-buffer=0.1";
+    // ★d283 取证：整串可被环境变量替换（默认不设 = 上面这套生产值）。
+    //   用途 = 真机上逐项 A/B「A 段 7.577s 到底卡在哪个选项」—— 每次只改环境变量、
+    //   重启、复投，不需要重编。纯诊断通道，出厂默认不生效。
+    if (const char* ov = std::getenv("FR_LIVE_OPTS"); ov != nullptr && *ov != '\0') {
+      opts = "demuxer-lavf-format=" + load_format;
+      opts += std::string(",") + ov;
+      FR_LOG_WARN("[MPV] FR_LIVE_OPTS 覆盖回流 per-file 选项: {}", ov);
+    }
+  }
+  if (!opts.empty()) {
     cmd.push_back("0");
     cmd.push_back(opts);
   }
@@ -297,9 +438,12 @@ void MpvBridge::load_uri(const std::string& uri, double start_sec) {
   for (auto& s : cmd) args.push_back(s.c_str());
   args.push_back(nullptr);
   int rc = mpv_command(mpv_, args.data());
-  FR_LOG_INFO("[MPV] loadfile {} start={} rc={}", clean, start > 0 ? start : 0.0, rc);
+  FR_LOG_INFO("[MPV] loadfile {} start={} fmt={} rc={}", clean, start > 0 ? start : 0.0,
+              load_format.c_str(), rc);
   // d151：记住最近一次点播（已去 fragment 的净 URL），供后端降级后按位重载复用。
-  last_uri_ = clean;
+  // d269：回环流 URI（tcp://127.0.0.1:）不进 last_uri_ —— 端口随会话销毁，
+  // 降级重载必然失败，且对实时流"重连到开头"语义本身不成立。
+  if (clean.rfind(fr::cast::kLoopbackUriPrefix, 0) != 0) last_uri_ = clean;
 }
 
 bool MpvBridge::reload_after_backend_switch() {

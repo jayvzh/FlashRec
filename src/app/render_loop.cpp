@@ -488,6 +488,10 @@ void RenderLoop::frame(double now) {
     // d124：顶栏"软件渲染"徽章的数据源（渲染线程自己的真值，当帧即准）
     in.sw_video = player_.software_video();
   }
+  // d310：标题栏硬/软解徽章数据源 —— media_ 是 2Hz 轮询缓存（与三合一徽章同源，
+  // 空串=取不到不画不猜；"no"=软解；其余=硬解后端名）。同 sw_video：渲染线程
+  // 本地真值，不入 input_changed 同步（ViewInput 整块 memcpy 跨线程）。
+  snprintf(in.hwdec, sizeof(in.hwdec), "%s", media_.hwname.c_str());
 
   // —— 缩略图预览：取最新结果，seq 变化时经 nvgCreateImageMem 上传（渲染线程独占 GL）——
   bool thumb_new = false;  // d43：新预览帧到达 = 一次重绘理由
@@ -727,6 +731,7 @@ void RenderLoop::frame(double now) {
   if (snap.uri != last_snap_.uri || snap.metadata != last_snap_.metadata ||
       snap.title != last_snap_.title || snap.next_uri != last_snap_.next_uri ||
       snap.next_metadata != last_snap_.next_metadata ||
+      snap.source != last_snap_.source ||  // d310：来源切换（DLNA↔AirPlay）必须重绘标题栏徽章
       snap.has_session != last_snap_.has_session ||
       snap.picture_ready != last_snap_.picture_ready ||
       snap.stopped_at != last_snap_.stopped_at ||
@@ -912,6 +917,7 @@ void RenderLoop::frame(double now) {
   }
   // —— 出帧闸门放行：从这里起本帧一定画，时间基准在此推进 ——
   prev_now_ = now;
+  frame_t0_ = now;  // ★d320：渲染泵帧成本计时起点
   // d54：放开 20fps 上限（用户裁决：d48 时代 60fps 的顾虑是「触发点多、占用高
   // 且持续」，根因已被 d51 悬停语义 + d53 旗标驱动消解 —— 出帧已全部按需，
   // 动画期占用高点只是事件响应）。min_gap/rate_ok 门控整体移除：动画帧由
@@ -972,6 +978,7 @@ void RenderLoop::frame(double now) {
   const bool size_changed = stage_fb_w != fbo_.width() || stage_fb_h != fbo_.height();
 
   // —— ① 视频路径：mpv → FBO（仅画面就绪时）——
+  mpv_t0_ = mono_now();  // ★d320：mpv 渲染段计时
   bool have_src = false;
   if (has_picture) {
     // 只在真正重渲时推进 FBO 内容 —— d50 起按 mpv 更新旗标门控（视频层的
@@ -1080,6 +1087,9 @@ void RenderLoop::frame(double now) {
   }
 
   // —— ② UI 路径：合成到 app_fbo_（d60：窗口内容唯一真值）——
+  pump_mpv_acc_ += (mono_now() - mpv_t0_) * 1000.0;  // ★d320：mpv 渲染段累计
+  if ((mono_now() - mpv_t0_) * 1000.0 > pump_mpv_max_)
+    pump_mpv_max_ = (mono_now() - mpv_t0_) * 1000.0;
   // v0.4.0 d56：full = 整窗路径（clip=nullptr，行为同 v0.3.1）；
   // partial = 区域路径：脏区并集 bbox（P0/P1 单矩形，见 damage.h damage_bbox）
   // → GL scissor（物理像素）+ nvgScissor（逻辑像素）双裁剪 → **只清脏区**（半透明
@@ -1158,9 +1168,11 @@ void RenderLoop::frame(double now) {
   int ctx_hover = -1;
   if (ctx_open_) {
     const bool media = snap.has_session;
+    // ★d322：AirPlay 会话禁用「播放 / 暂停」条目（直播流不支持暂停，与底栏同判定）
+    const bool pause_ok = media && snap.source != CastSource::AirPlay;
     auto add = [&](const char* label, CtxAction a, bool en, bool chk = false,
                    bool checked = false) { ctx_items[ctx_n++] = {label, a, en, chk, checked}; };
-    add("播放 / 暂停", CtxAction::PlayPause, media);
+    add("播放 / 暂停", CtxAction::PlayPause, pause_ok);
     // d158：与底栏同判定 —— 无上/下一集数据（next_uri 空）时不给这两个条目
     //（菜单每帧重建，数据到来/消失即随之增减，布局与命中同帧自洽）。
     if (!snap.next_uri.empty()) {
@@ -1418,6 +1430,24 @@ void RenderLoop::frame(double now) {
                      cb, clip);
   }
 
+  // —— mpv 信息整包：2Hz 一次（d310 提出门控：标题栏硬/软解徽章无开关，有会话即查；
+  // 三合一与旧视频帧率徽章共用同一次查询，d45）——
+  if (!pip_mode_ && (show_info_ || show_video_fps_ || snap.has_session) &&
+      now - media_at_ > 0.5) {
+    media_at_ = now;
+    const VideoStats st = player_.video_stats();
+    media_.vfps = st.fps;
+    media_.w = st.w;
+    media_.h = st.h;
+    media_.vbr = st.video_br > 0 ? st.video_br : st.bitrate;  // 视频码率优先退总码率
+    media_.abr = st.audio_br;
+    media_.asr = st.audio_sr;
+    media_.ach = st.audio_ch;
+    media_.vcodec = st.video_codec;
+    media_.acodec = st.audio_codec;
+    media_.hwname = st.hwdec_name;
+  }
+
   // —— d44/d45 → d146 R5 常驻徽章（叠在视频/舞台左上角，画中画小窗不画）——
   // 三合一（show_info_）：每行一条独立胶囊纵向堆叠（d149 用户改稿），fps 条恒在
   // 最前（video|ui 英文标签）、视频条（分辨率/编码/码率/硬解软解）、音频条
@@ -1446,21 +1476,7 @@ void RenderLoop::frame(double now) {
       }
       fps_last_draw_ = now;
     }
-    // mpv 信息整包：2Hz 一次（三合一与旧视频帧率徽章共用同一次查询，d45）
-    if ((show_info_ || show_video_fps_) && now - media_at_ > 0.5) {
-      media_at_ = now;
-      const VideoStats st = player_.video_stats();
-      media_.vfps = st.fps;
-      media_.w = st.w;
-      media_.h = st.h;
-      media_.vbr = st.video_br > 0 ? st.video_br : st.bitrate;  // 视频码率优先退总码率
-      media_.abr = st.audio_br;
-      media_.asr = st.audio_sr;
-      media_.ach = st.audio_ch;
-      media_.vcodec = st.video_codec;
-      media_.acodec = st.audio_codec;
-      media_.hwname = st.hwdec_name;
-    }
+    // mpv 信息整包查询已提出门控（d310：见上方独立段，标题栏徽章共用 media_）
     const float px = L.badgeOriginX;
     const float py = in.fullscreen ? L.badgeOriginYFs : L.topBarH + L.badgeOriginYWin;
     if (show_info_) {
@@ -1746,6 +1762,28 @@ void RenderLoop::frame(double now) {
   window_.swap_buffers();
   // mpv 官方要求：每次 render 后成对调用，否则内部同步退化
   player_.report_swap();
+
+  // ★d320：渲染泵帧成本按秒聚合 —— 卡顿归因 instrumentation。整帧耗时 = 闸门
+  //   放行到 swap（mpv 渲染 + nanovg 全场景 + blit + swap + DWM）；mpv 段单独
+  //   计量。4K 高动态流下 avg/max 超过帧间隔（~40ms@25fps）即为显示泵过载。
+  {
+    const double now_end = mono_now();
+    const double total_ms = (now_end - frame_t0_) * 1000.0;
+    pump_total_acc_ += total_ms;
+    if (total_ms > pump_total_max_) pump_total_max_ = total_ms;
+    pump_n_++;
+    if (pump_log_at_ == 0.0) pump_log_at_ = now_end;
+    if (now_end - pump_log_at_ >= 1.0) {
+      FR_LOG_INFO(
+          "[渲染泵] 帧数={} 整帧 avg={:.1f}ms max={:.1f}ms | mpv段 avg={:.1f}ms "
+          "max={:.1f}ms（整帧>40ms 追不上实时）",
+          pump_n_, pump_total_acc_ / pump_n_, pump_total_max_,
+          pump_n_ ? pump_mpv_acc_ / pump_n_ : 0.0, pump_mpv_max_);
+      pump_total_acc_ = pump_total_max_ = pump_mpv_acc_ = pump_mpv_max_ = 0.0;
+      pump_n_ = 0;
+      pump_log_at_ = now_end;
+    }
+  }
 }
 
 // 把视图回调包装成"投递意图"（渲染线程 → 主线程）。

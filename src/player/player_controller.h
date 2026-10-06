@@ -51,8 +51,23 @@ class PlayerController {
   void report_gl_crash();
   // d184：视频填充（cover=1 / contain=0）
   void set_panscan(double p);
+  // ★d295：当前是否处于「镜像自适应填充」模式（回环镜像流 = d281 的按比例自适应）。
+  //   切皮肤时需要它做闸门 —— 见 main.cpp 的切皮肤逻辑。
+  bool fit_auto_active() const { return fit_auto_; }
+  // ★d295：切皮肤后把 panscan 交还给自适应判决。
+  //   病灶：切皮肤会无条件 set_panscan(皮肤 fit) ⇒ 把 d281 已下发的自适应判决**覆盖掉**。
+  //   实测（16:24:03）：panscan 由 1 变0，render 日志从
+  //   `(75,0) 1770x884 -> (0,0) 960x480`（裁两侧、上下铺满）
+  //   退回 `(0,0) 1920x884 -> (0,19) 960x442`（留边、上下黑边）。
+  //   ⇒ 自适应期间切皮肤**不应**动 panscan；非自适应期间才听皮肤的。
+  void restore_fit_after_skin_change();
   // d196：留边底色（letterbox）= 皮肤 stageBg，避免 contain 恒黑边
   void set_background_color(const std::string& rgb_hex);
+  // ★d281：镜像自适应填充 —— 主循环每轮把**舞台宽高比**（逻辑坐标，顶栏可见时不计入）
+  // 推给播放器。**只对回环（AirPlay 镜像/音频）流生效**：视频比舞台宽 → cover
+  // （铺满，先裁掉的正是源内烧录黑边）；比舞台窄 → contain（竖屏镜像保住整屏，上下已满）。
+  // DLNA 直链不适用 —— 电影 2.39:1 被 cover 会裁掉三成画面，那些继续由皮肤 fit 决定。
+  void set_stage_aspect(double aspect);
   // d151：后端降级后按位重载续播（主线程 tick 内调用；切换本身由渲染线程做）。
   // 返回 true = 本次真的重载了当前文件。
   bool reload_after_backend_switch();
@@ -97,6 +112,46 @@ class PlayerController {
   PlaybackSnapshot snap_;            // 唯一真值快照
   std::deque<DmrCommand> pending_;   // TRANSITIONING 期排队（不变量 6：只排队不合并）
   double now_ = 0.0;
+  // d279：端到端延迟探针（仅回环实时流；tcp://127.0.0.1:）。
+  //   live_start_wall_ = 本次 loadfile 的墙钟（steady 秒），live_probe_next_ = 1s 限频。
+  //   物理意义：端到端积压 =（当前墙钟 − live_start_wall_）− time-pos。
+  //   它只含「接收端侧」积压（生产队列 + TCP + mpv demuxer + 解码显示），
+  //   不含客户端编码/网络 —— 这正好能把「10s 在谁那边」一刀切开。
+  double live_start_wall_ = -1.0;
+  double live_probe_next_ = 0.0;
+  // ★d312：本会话的回环加载格式（"mpegts"/"latm"/"caf"/"aac"，DLNA 恒空）。
+  //   暂停恢复跳直播前沿时重载 URI 必须带上它（否则裸流探测重走字节门，d285）。
+  std::string live_format_;
+  // ★d322：直播回流延迟追赶控制器——积压超阈值自动倍速消费（scaletempo2 不变调），
+  //   追平回 1.0。AirPlay 会话的用户倍速按钮/命令已禁用，倍速权归控制器。
+  double catchup_speed_ = 1.0;
+  // ★d323：控制器采样计时（200ms 周期，d322 的 1s 提频）。
+  double catchup_next_ = 0.0;
+  // ★d283 取证：真机报「延迟 10s+」，实测三段已排除生产积压(0.02s)与 demuxer 预读(0.10s)，
+  //   但「loadfile → 第一条延迟探针」的 7.58s 无法定性 —— 旧探针只由 time-pos 事件驱动，
+  //   而该事件要等 mpv 开播才发，且状态需 file-loaded 才翻 PLAYING，两个未知量（mpv 侧
+  //   就绪耗时 / 主线程 auto-play 冲队耗时）被折成一条。下面两个墙钟把这一刀切成三段：
+  //   loadfile →(A: mpv 就绪)→ file-loaded →(B: 开播排队)→ 首个 time-pos。
+  //   ★A+B 都算进「接收端积压」，但修法完全不同，必须先分离。
+  double live_loaded_wall_ = -1.0;      // 本次 loadfile 的 file-loaded 墙钟（-1=未到）
+  double live_firstpos_wall_ = -1.0;    // 首个有效 time-pos 的墙钟（-1=未到）
+  // ★d281：镜像自适应填充状态（全在主线程 tick 内读写，无并发）。
+  //   fit_auto_       = 本次加载是不是回环镜像流（唯一开关，DLNA 恒 false）
+  //   stage_aspect_   = 舞台宽高比（主循环推送；窗口缩放/全屏切换即时更新）
+  //   fit_applied_    = 已下发的 panscan（-1 = 本会话尚未判定）
+  //   fit_probe_next_ = 比例轮询限频（0.5s；流中途换比例/手机旋转也能跟上）
+  bool fit_auto_ = false;
+  // ★d299：探针断流检测（apts 连续不动的采样计数 + 上次 apts）。
+  //   用于在客户端断开后停打「接收端积压」—— 它会随墙钟线性增长，是记账假象。
+  // ★d302：数据侧延迟的滑动峰值（demuxer 已读位置 − time-pos）。
+  //   用户感知的是「最坏的那几秒」而非瞬时值，故保留峰值；回落时按 0.98 缓慢衰减，
+  //   避免单次尖峰永久钉住读数。
+  double live_data_side_ = 0.0;
+  double live_probe_last_apts_ = -1.0;
+  int live_probe_stall_ = 0;
+  double stage_aspect_ = 0.0;
+  double fit_applied_ = -1.0;
+  double fit_probe_next_ = 0.0;
   double last_pos_pub_ = -1.0;       // 位置节流 1s（GENA 位置类）
   double transition_at_ = 0.0;       // TRANSITIONING 起始（15s 看门狗，不变量 5）
   double stop_at_ = 0.0;             // STOPPED 时刻（保持期 R5）

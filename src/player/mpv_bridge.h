@@ -105,8 +105,22 @@ class MpvBridge {
   void set_event_cb(EventCb cb) { event_cb_ = std::move(cb); }
   void pump();  // 主线程每帧：非阻塞取空 mpv 事件队列
 
+  // d273 诊断快照：抓 mpv 关键只读属性（强停/异常时落日志——判断流是否到达 mpv、
+  // 轨是否建出、缓存是否推进）。仅主线程调用（mpv API 线程纪律）。
+  std::string diag_snapshot();
+
+  // d279：轻量取单个只读属性（字符串形式）。探针 1s 限频调用，不需要全量快照。
+  std::string get_prop(const char* name);
+
+  // d281：视频显示宽高比（`video-params/aspect`，已含像素比修正）。
+  // 无视频/未就绪/异常值一律返回 0（调用方据此跳过判定）。
+  // 用途：镜像自适应填充 —— AirPlay 镜像流的形状 = **手机屏幕形状**
+  //（实测 1920x884 = 19.5:9 横屏、498x1080 = 竖屏），跟舞台比才知道该 cover 还是 contain。
+  double video_aspect();
+
   // —— 命令（mpv 自身线程安全；实际调用点全在主线程）——
-  void load_uri(const std::string& uri, double start_sec = -1.0);  // R1：replace，不重建句柄
+  void load_uri(const std::string& uri, double start_sec = -1.0,
+                const std::string& load_format = {});  // R1：replace，不重建句柄
   void set_pause(bool p);
   void seek_abs(double sec);
   void set_volume(int vol);  // 0-100
@@ -142,6 +156,10 @@ class MpvBridge {
   // d124：软件兜底状态。gl_broken_ 由主线程（pump）置位、渲染线程读；
   // 其余字段只在渲染线程被触碰。
   std::atomic<bool> gl_broken_{false};
+  // d287：FR_MPV_TRACE=1 时置位 —— 把 mpv 的 info/debug/v 级内部日志也转进运行时日志。
+  //   ★为什么需要：本文件只把「非 render 模块的 WARN 及以上」落盘，v 级请求白要 ——
+  //   真机「起播后钉死 time-pos=0」时，cplayer/demux 侧到底在等什么，日志里一个字都没有。
+  bool log_trace_ = false;
   VideoBackend backend_ = VideoBackend::GL;
   std::vector<unsigned char> sw_buf_;  // RGBA8，sw_w_ * sw_h_
   int sw_w_ = 0;

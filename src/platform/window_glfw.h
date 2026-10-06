@@ -176,6 +176,11 @@ class WindowGLFW {
 
   GLFWwindow* raw() const { return win_; }
 
+  // ★d282：原生窗口句柄（Win32 = HWND；其它平台/null 窗口返回 nullptr）。
+  // 给 crash_dump 的卡死看门狗做 IsHungAppWindow 判据用 —— 注意 GLFWwindow*
+  // **不是** HWND，两者不可混用。平台差异收在 .cpp 里。
+  void* native_handle() const;
+
   // 用户拖拽调整窗口大小中（d39 起由统一拖拽状态机驱动，Windows wndproc 同写此标记）；
   // 渲染线程据此冻结 FBO 重建、降级为旧纹理拉伸。
   void set_resizing(bool on) { resizing_ = on; }

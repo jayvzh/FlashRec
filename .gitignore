@@ -34,3 +34,8 @@ Thumbs.db
 # Python 字节码缓存（tools/ 下的脚本被 import 时生成）
 __pycache__/
 *.pyc
+
+# d265：翻译线已归档（archive/translate-line-v0.6.0），模型资产留盘不进 git
+/models/
+/third_party/
+*.obj

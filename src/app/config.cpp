@@ -331,6 +331,22 @@ Config Config::load(const std::string& path) {
   // d169：倍速持久化（player.speed，夹到 0.25..4.0）
   cfg.player_speed = get_double("player.speed", cfg.player_speed);
   if (cfg.player_speed < 0.25) cfg.player_speed = 0.25;
+
+  // —— airplay（v0.6.0 d267；§9 键表；FR_AIRPLAY=OFF 时这些值不被消费）——
+  cfg.airplay_enabled = get_bool("airplay.enabled", cfg.airplay_enabled);
+  if (auto* v = get("airplay.friendly_name"); v) cfg.airplay_friendly_name = *v;
+  cfg.airplay_rtsp_port = get_int("airplay.rtsp_port", cfg.airplay_rtsp_port);
+  cfg.airplay_mirror_port = get_int("airplay.mirror_port", cfg.airplay_mirror_port);
+  cfg.airplay_udp_timing_port = get_int("airplay.udp_timing_port", cfg.airplay_udp_timing_port);
+  cfg.airplay_udp_control_port = get_int("airplay.udp_control_port", cfg.airplay_udp_control_port);
+  cfg.airplay_udp_data_port = get_int("airplay.udp_data_port", cfg.airplay_udp_data_port);
+  cfg.airplay_h265 = get_bool("airplay.h265", cfg.airplay_h265);
+  cfg.airplay_hls = get_bool("airplay.hls", cfg.airplay_hls);
+  cfg.airplay_pin_auth = get_bool("airplay.pin_auth", cfg.airplay_pin_auth);
+  if (auto* v = get("airplay.password"); v) cfg.airplay_password = *v;
+  cfg.airplay_feedback_timeout_sec =
+      get_int("airplay.feedback_timeout_sec", cfg.airplay_feedback_timeout_sec);
+  cfg.log_airplay_inbox = get_bool("log.airplay_inbox", cfg.log_airplay_inbox);
   if (cfg.player_speed > 4.0) cfg.player_speed = 4.0;
   if (!j.protocol_info.empty()) cfg.protocol_info = j.protocol_info;
   FR_LOG_INFO("[APP] 配置加载完成 {}：port={} auto_play={} retention={}s reconnect={}", path,

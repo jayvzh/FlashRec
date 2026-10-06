@@ -758,4 +758,15 @@ void WindowGLFW::move_to_workarea_corner(int w, int h) {
   glfwSetWindowPos(win_, ax + aw - w, ay + ah - h);
 }
 
+// d282：对齐 GLFWwindow* → 平台原生窗口句柄（Win32 侧 = HWND）。
+// 为什么不能直接用 raw()：GLFWwindow 是 GLFW 自己的不透明结构，不是 HWND，
+// 拿去喂 IsHungAppWindow 只会永远判假（看门狗直接哑掉）。
+void* WindowGLFW::native_handle() const {
+#if defined(_WIN32)
+  return win_ ? reinterpret_cast<void*>(glfwGetWin32Window(win_)) : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
 }  // namespace fr

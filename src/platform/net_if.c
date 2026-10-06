@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netpacket/packet.h>  // d267：AF_PACKET / sockaddr_ll（MAC 枚举）
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
@@ -31,6 +32,8 @@ typedef struct FrNetIf {
   unsigned int index; // Win IfIndex / Linux if_nametoindex
   unsigned int addr;  // 网络序
   unsigned int nmask; // 网络序
+  unsigned char mac[6]; // d267：物理 MAC（AirPlay device_id 身份；无则 has_mac=0）
+  int has_mac;
 } FrNetIf;
 
 static FrNetIf g_ifs[FR_NET_IF_MAX];
@@ -108,7 +111,17 @@ static void add_if(const char* ip, const char* mask, const char* name, unsigned 
   struct in_addr a, m;
   e->addr = (inet_pton(AF_INET, e->ip, &a) == 1) ? a.s_addr : 0u;
   e->nmask = (inet_pton(AF_INET, e->mask, &m) == 1) ? m.s_addr : 0u;
+  memset(e->mac, 0, sizeof(e->mac));  // d267：每轮扫描重置 MAC（防旧残留）
+  e->has_mac = 0;
   ++g_count;
+}
+
+// d267：把 MAC 填到最近一次 add_if 的条目上（调用点紧跟 add_if；len!=6 视为无 MAC）。
+static void set_last_mac(const unsigned char* m, int len) {
+  if (g_count <= 0 || !m || len != 6) return;
+  FrNetIf* e = &g_ifs[g_count - 1];
+  memcpy(e->mac, m, 6);
+  e->has_mac = 1;
 }
 
 // 稳定分区：物理网卡在前，虚拟/隧道的在后（各自保持原枚举顺序）
@@ -167,6 +180,7 @@ static int scan_impl(void) {
       char name[128] = {0};
       WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, name, (int)sizeof(name) - 1, NULL, NULL);
       add_if(ip, mask, name, (unsigned int)a->IfIndex);
+      set_last_mac(a->PhysicalAddress, (int)a->PhysicalAddressLength);  // d267
       break; // 每个适配器只取第一个 IPv4 地址
     }
   }
@@ -177,6 +191,22 @@ static int scan_impl(void) {
 static int scan_impl(void) {
   struct ifaddrs* ifap = NULL;
   if (getifaddrs(&ifap) != 0) return 0;
+
+  // d267：先收 AF_PACKET 条目的 name→MAC（getifaddrs 把链路层地址作为独立
+  // 条目返回，与 AF_INET 条目按 ifa_name 同名配对）。
+  struct PktMac { const char* name; const unsigned char* mac; };
+  struct PktMac pkts[FR_NET_IF_MAX];
+  int npkt = 0;
+  for (struct ifaddrs* ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_PACKET) continue;
+    const struct sockaddr_ll* sll = (const struct sockaddr_ll*)ifa->ifa_addr;
+    if (sll->sll_halen != 6 || !sll->sll_addr) continue;
+    if (npkt < FR_NET_IF_MAX) {
+      pkts[npkt].name = ifa->ifa_name;
+      pkts[npkt].mac = sll->sll_addr;
+      ++npkt;
+    }
+  }
 
   for (struct ifaddrs* ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
     if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
@@ -192,6 +222,12 @@ static int scan_impl(void) {
       snprintf(mask, sizeof(mask), "0.0.0.0");
     }
     add_if(ip, mask, ifa->ifa_name, if_nametoindex(ifa->ifa_name));
+    for (int i = 0; i < npkt; ++i) {  // d267：同名配对 MAC
+      if (strcmp(pkts[i].name, ifa->ifa_name) == 0) {
+        set_last_mac(pkts[i].mac, 6);
+        break;
+      }
+    }
   }
   freeifaddrs(ifap);
   return g_count;
@@ -199,6 +235,21 @@ static int scan_impl(void) {
 #endif
 
 // ---------- 对外接口 ----------
+
+// d267：取首个物理网卡的 MAC（AirPlay device_id 身份源）。
+// 列表已按"物理优先"排序，首条 has_mac 即物理网卡 MAC；全部无 MAC（纯虚拟
+// 环境）返回 0，调用方回退"随机生成 + 持久化"（避免重启换身份被 iOS 视为新设备）。
+int fr_net_if_hwaddr(unsigned char out[6]) {
+  if (!out) return 0;
+  if (g_count <= 0) fr_net_if_scan();
+  for (int i = 0; i < g_count; ++i) {
+    if (g_ifs[i].has_mac) {
+      memcpy(out, g_ifs[i].mac, 6);
+      return 1;
+    }
+  }
+  return 0;
+}
 
 int fr_net_if_scan(void) {
   g_count = 0;

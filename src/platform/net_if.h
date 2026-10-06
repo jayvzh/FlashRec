@@ -49,6 +49,11 @@ const char* fr_net_if_mask(int idx);   // 子网掩码，如 "255.255.255.0"
 const char* fr_net_if_name(int idx);   // 系统接口名（Win 为 FriendlyName）
 unsigned int fr_net_if_index(int idx); // 系统接口索引（Win IfIndex / Linux if_nametoindex）
 
+// d267：取首个物理网卡的 MAC（AirPlay device_id 身份源；列表物理优先排序）。
+// 未扫描过则先扫。成功返回 1 并填充 out[6]；全部接口无 MAC（纯虚拟环境）返回 0，
+// 调用方回退"随机生成 + 持久化"（避免重启换身份被 iOS 视为新设备）。
+int fr_net_if_hwaddr(unsigned char out[6]);
+
 // HTTP 服务（pupnp miniserver）应绑定的地址：固定通配，让所有网卡可达。
 const char* fr_net_if_http_bind(void);
 

@@ -4,6 +4,21 @@ include(FetchContent)
 
 set(FR_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ---- 内嵌 AirPlay（v0.6.0，AIRPLAY_EMBED_PLAN.md）----
+# ON（默认，方案 §10.1）：把 UxPlay 的协议库编成静态库 uxplay_airplay 并挂 AirPlay 适配器。
+# OFF：cast/ 不编译、uxplay.cmake 整体 return、OpenSSL/libplist 不 find，产物回归纯 DMR
+#（模块化要求；也是"依赖装不上时"的退路）。
+# 注意 event_bus 的 AirplayEvent 队列是**无条件**保留的（无生产者即空队列，零开销）。
+option(FR_AIRPLAY "内嵌 AirPlay 接收端（UxPlay lib；开发默认 OFF，发布口径钉 ON —— 规划 §10）" OFF)
+
+# pthreads4w 预编译前缀：pupnp 在 Windows 上 find_package(PTHREADS4W) 找它。
+# ★与 FR_AIRPLAY 无关（DMR 侧一直需要）：新开的构建目录若不带上这个前缀，
+#   配置会在 third_party/pupnp/CMakeLists.txt 直接失败。之前只存在于某个 build/
+#   的缓存里，等于"换台机器/清目录就配不起来"——这里显式注入，让配置可复现。
+if (WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pthreads4w/install)
+  list(APPEND CMAKE_PREFIX_PATH ${CMAKE_CURRENT_SOURCE_DIR}/third_party/pthreads4w/install)
+endif()
+
 # ---- glfw ----
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -120,3 +135,54 @@ else()
   set(MPV_LIBRARY PkgConfig::MPV)   # IMPORTED target 自带 include 目录与链接
   set(MPV_INCLUDE_DIR)
 endif()
+
+# ---- UxPlay lib（内嵌 AirPlay，d237）----
+# 必须在最后：它依赖上面已经定好的 FR_ROOT，且它导出的 FR_AIRPLAY_SOURCES /
+# uxplay_airplay 目标由根 CMakeLists 消费。
+include(${CMAKE_CURRENT_LIST_DIR}/uxplay.cmake)
+
+# 请求原文收件箱（d242，M1 诊断设施）：构建期锚点补丁，必须在 uxplay.cmake 之后
+# （它需要 FR_AIRPLAY 的判定），也必须在 add_subdirectory 编译之前（本项目静态库
+# 是直接 add_library 加源文件，Configure 阶段就会读盘 ⇒ 顺序天然正确）。
+include(${CMAKE_CURRENT_LIST_DIR}/airplay_inbox.cmake)
+fr_apply_airplay_inbox()
+
+# —— UxPlay 镜像补丁（d315）：空 type-0x01 包不再判死 ——
+# 真机实证（2026-10-05，iPhone17,1）：即便已广播 features bit42（h265=true），
+# iPhone 仍会间歇发出 payload_size==0 的 type-0x01 包；UxPlay 原判词（日志里
+# 的「非 h264 且未置 bit42」）只是作者猜测，按致命处理 ⇒ unsupported_codec ⇒
+# conn_reset ⇒ 整条镜像秒死（21:13/21:28/22:08/22:18 四次「投屏全灭」都是它，
+# 与 h265 开关无关）。处置：记日志、丢本包、继续收流 —— 后续 type-0x00 视频
+# 包正常到达即恢复；若真是不可解的流，既有的「500ms 无视频帧 → 纯音频回退」
+# 照常兜底，不比现在更差。
+option(FR_AIRPLAY_MIRROR_EMPTY01_PATCH "UxPlay 镜像补丁：空 type-0x01 包不判死" ON)
+set(_mirror01_enable ${FR_AIRPLAY_MIRROR_EMPTY01_PATCH})
+if (NOT FR_AIRPLAY)
+  set(_mirror01_enable OFF)  # AirPlay 整体关掉时强制还原，源码树不留半补丁状态
+endif()
+fr_patch_toggle_file(${_mirror01_enable}
+  "${FR_ROOT}/third_party/uxplay/lib/raop_rtp_mirror.c"
+  "uxplay 镜像补丁"
+  "lib/raop_rtp_mirror.c 空 type-0x01 包"
+  [=[
+                if (payload_size == 0) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror: received type 0x01 packet with no payload:\n"
+                               "this indicates non-h264 video but Airplay features bit 42 (SupportsScreenMultiCodec) is not set\n"
+                               "use startup option \"-h265\" to set this bit and support h265 (4K) video");
+                    unsupported_codec = true;
+                    break;
+                }]=]
+  [=[
+                if (payload_size == 0) {
+                    /* FLASHREC-PATCH d315 (cmake/deps.cmake): an empty type-0x01
+                     * packet is NOT fatal. Field evidence (2026-10-05, iPhone17,1):
+                     * it arrives intermittently even with features bit 42
+                     * advertised, so the original guess logged below
+                     * ("non-h264 without bit42") does not hold. Killing the
+                     * mirror tears down the whole session while the phone keeps
+                     * streaming. Log and carry on. */
+                    logger_log(raop_rtp_mirror->logger, LOGGER_WARNING,
+                               "raop_rtp_mirror: empty type-0x01 packet ignored (FLASHREC d315), keep stream");
+                    break;
+                }]=]
+  "AIRPLAY_EMBED_PLAN.md")

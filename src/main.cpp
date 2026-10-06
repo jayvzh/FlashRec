@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>   // d282：看门狗验收钩子（主线程人工卡死）
 #include <vector>
 
 #define GLFW_INCLUDE_NONE
@@ -32,6 +33,9 @@
 #include "app/render_loop.h"
 #include "app/view_state.h"
 #include "dmr/dmr_device.h"
+#ifdef FR_AIRPLAY
+#include "cast/airplay/airplay_source.h"  // v0.6.0：AirPlay 门面（d269 M0 装配）
+#endif
 #include "platform/net_if.h"   // 多网卡（d110）：启动打印候选接口
 #include "platform/clipboard.h"
 #include "platform/console.h"  // 运行时控制台（--console）+ UTF-8（d163）
@@ -414,6 +418,11 @@ int main(int argc, char** argv) {
     FR_LOG_INFO("[APP] 倍速恢复 {}x（settings.json: player.speed）", cfg.player_speed);
   }
   DmrDevice dmr(bus, cfg);
+#ifdef FR_AIRPLAY
+  // d269：AirPlay 门面（失败仅 WARN 不致命，与 dmr.start 同待遇；D6 会话互斥
+  // ——两协议常驻监听，任意新投屏无条件接管，以最新投屏为播放内容）
+  cast::AirplaySource airplay(bus, cfg);
+#endif
   // —— 多网卡（v0.5.0 / d110）：把参与 SSDP/HTTP 的候选接口全列出来 ——
   // 排查「控制点搜不到设备」的第一现场就是「选错了网卡」，此前只能靠猜（本机真被
   // Hyper-V 虚拟交换机抢过）。顺序即选路优先级：物理网卡在前，虚拟/隧道在后；
@@ -437,6 +446,11 @@ int main(int argc, char** argv) {
   if (!dmr.start()) {
     FR_LOG_WARN("[APP] DMR 启动失败（检查端口占用/防火墙），UI 继续运行");
   }
+#ifdef FR_AIRPLAY
+  if (!airplay.start()) {
+    FR_LOG_WARN("[APP] AirPlay 启动失败（mDNS/端口），DLNA 继续运行");
+  }
+#endif
   keep_awake::set(true);
 
   // —— 跨线程通道 + 渲染线程 ——
@@ -473,6 +487,10 @@ int main(int argc, char** argv) {
   }
   window.release_context();   // 交出 GL 上下文（GLFW 要求先在旧线程 make null）
   render.start();             // 渲染线程接管：make current → 初始化 GL 资源 → 循环
+  // ★d282：主线程卡死看门狗（AppHang 类故障没有异常、没有 dump、日志在卡死瞬间
+  //   整齐断掉 —— 2026-09-30 两起真机挂起就是这种"手上什么都没有"的局面）。
+  //   判据 = 心跳停滞 + IsHungAppWindow 为真（拖拽窗口那种合法模态循环不误报）。
+  crash_dump::start_hang_watchdog(window.native_handle(), 5000);
 
   // —— d74 剪贴板链接 → mpv 探测 → 提示条（settings.json: clipboard.play）——
   // Win 事件模式（系统级监听，免前台）；Linux/macOS 返回 false → 主循环 1s 轮询。
@@ -976,7 +994,13 @@ int main(int argc, char** argv) {
     theme = skin_pack[idx].theme;
     render.set_theme(skin_pack[idx].theme);
     render.set_skin_list(skin_ids, skin_names, idx);
-    player.set_panscan(theme.layout.stageCover ? 1.0 : 0.0);  // d184：随皮肤更新填充
+    // ★d295：镜像自适应填充（d281）期间**不下发** panscan —— 皮肤 stageCover 会把已判定的
+    //   自适应结果覆盖掉（真机 16:24:03 实测：panscan 1→0，画面由上下铺满退回上下黑边）。
+    //   自适应由 player_controller 每 0.5s 按「视频比例 vs 舞台比例」重判，皮肤改不动它。
+    if (player.fit_auto_active())
+      player.restore_fit_after_skin_change();
+    else
+      player.set_panscan(theme.layout.stageCover ? 1.0 : 0.0);  // d184：随皮肤更新填充
     player.set_background_color(stage_bg_rgb(theme.stageBg));  // d196：随皮肤更新留边底色
     cfg.skin = skin_pack[idx].meta.id;
     Config::patch(paths::config_file(), {{"ui", "skin", "\"" + cfg.skin + "\""}});
@@ -1457,8 +1481,21 @@ int main(int argc, char** argv) {
   bool mute_last = cfg.player_muted;
   bool vol_dirty = false;
   double vol_settle_at = 0;
+  // ★d282：看门狗验收钩子（一次性）——"卡死自动落 dump"这条能力必须能被证伪，
+  //   否则只是一段没人跑过的代码。FR_TEST_HANG_MS=8000 启动 ⇒ 主线程在首轮
+  //   人工睡 8s ⇒ 期望 logs/hang-*.dmp + [HANG] 日志（Windows 约 5s 才把窗口
+  //   标成"未响应"，故该值必须 > 看门狗阈值 5000）。
+  int test_hang_ms = 0;
+  if (const char* v = getenv("FR_TEST_HANG_MS")) test_hang_ms = atoi(v);
   while (!window.should_close()) {
     const double now = mono_now();
+    crash_dump::beat();  // ★d282：主线程心跳（卡死看门狗的唯一判据源；一次原子写）
+    if (test_hang_ms > 0) {
+      const int ms = test_hang_ms;
+      test_hang_ms = 0;
+      FR_LOG_WARN("[APP] d282 测试钩子：主线程人工卡死 {}ms（验收看门狗）", ms);
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
     in.now = now;  // 无输入也推进（idle 淡出用）
     double dt = now - prev_now;
     prev_now = now;
@@ -1473,9 +1510,41 @@ int main(int argc, char** argv) {
       player.on_command(c);
     }
     // 2) 状态机泵（mpv 事件 → 转移 + 快照发布）
+    // ★d281：先把「舞台宽高比」交给播放器（镜像自适应填充判据）。舞台 = 窗口逻辑尺寸
+    //   − 顶栏（顶栏只在非全屏时占位，与 render_loop.cpp 的 stage_top 同一规则）。
+    //   只读窗口属性、只写播放器一个 double，无锁无分配；窗口缩放/全屏切换即时生效。
+    {
+      const double sw = (double)window.logical_width();
+      const double sh = (double)window.logical_height() -
+                        (window.fullscreen() ? 0.0 : (double)theme.layout.topBarH);
+      player.set_stage_aspect(sh > 1.0 ? sw / sh : 0.0);
+    }
     player.tick(now);
     // 3) DMR 差量 NOTIFY
     dmr.tick();
+#ifdef FR_AIRPLAY
+    // 3.5) AirPlay 心跳看门狗 + 事件面（d269 M0：事件只打日志，UI 徽章随 M2 接线）
+    airplay.tick();
+    for (const auto& ev : bus.drain_airplay()) {
+      switch (ev.kind) {
+        case AirplayEvent::Kind::Pin:
+          FR_LOG_INFO("[APP] AirPlay 配对码 {}", ev.pin);
+          break;
+        case AirplayEvent::Kind::ClientConnected:
+          FR_LOG_INFO("[APP] AirPlay 客户端已连接");
+          break;
+        case AirplayEvent::Kind::ClientDisconnected:
+          FR_LOG_INFO("[APP] AirPlay 客户端已断开");
+          break;
+        case AirplayEvent::Kind::MirrorStarted:
+          FR_LOG_INFO("[APP] AirPlay 镜像开始");
+          break;
+        case AirplayEvent::Kind::MirrorStopped:
+          FR_LOG_INFO("[APP] AirPlay 镜像结束");
+          break;
+      }
+    }
+#endif
     // 4) 窗口事件（模态循环会在此阻塞，但渲染线程不受影响）
     window.poll_events();
     tray::poll();  // d81：Linux 托盘图标窗口 X 事件（Win 空操作）
@@ -1624,6 +1693,10 @@ int main(int argc, char** argv) {
   }
 
   // —— 收尾 ——
+  // ★d282：先停心跳看门狗 —— 收尾阶段本就会长时间停心跳（拆 GL/驱动、等 join），
+  //   若不先停，它会把"正常的慢退出"当成卡死抓一堆 dump（d150 那种真僵尸另有
+  //   window_is_hung 的"窗口已销毁 ⇒ 视为卡死"判据兜着，不靠误报）。
+  crash_dump::stop_hang_watchdog();
   // d68 §5：Alt+F4 / 系统关机等不经 Close 意图的关闭路径同样先隐窗（幂等；
   // Close 意图路径在 exec_intent 里已隐），网络收尾照旧在后台执行。
   window.hide_window();
@@ -1641,6 +1714,12 @@ int main(int argc, char** argv) {
   // 顺序关键：先停渲染线程（释放 GL 资源、交还上下文），再动窗口/播放器。
   render.stop();
   thumb.shutdown();  // 渲染线程已停，不再读结果槽；先停 worker 再销毁 mpv
+
+#ifdef FR_AIRPLAY
+  // d269：先拆 AirPlay（raop_destroy 含 httpd 停止 + mDNS goodbye 发 farewell），
+  // 再收尾 mpv/DMR —— 断连事件先于播放侧停止，避免 lib 回调线程撞上 shutdown。
+  airplay.stop();
+#endif
 
   // 任何形式的窗口关闭都推送"投屏结束"：
   // Stop（R5 进度快照固化）→ STOPPED → dmr.tick 冲出最终 NOTIFY → BYEBYE

@@ -1,4 +1,4 @@
-# 第三方 C 库「构建期锚点补丁」的通用工具（v0.5.0）
+# 第三方 C 库「构建期锚点补丁」的通用工具
 #
 # 为什么这样做（AGENTS.md 规则 8：third_party/ 只读，要改走构建期 patch）：
 #   不在源码树里提交改动，改为构建期做**字符串级锚点替换**。
@@ -9,15 +9,27 @@
 #           绝不静默漏补；错误信息里带文件、锚点与文档指针
 #   · 逻辑主体在我方源码，第三方源码里只留「调用我方函数」的钩子
 #
-# 用法：fr_pupnp_patch_toggle(<开关变量名> <相对 third_party/pupnp 的路径> <锚点原文> <替换后文本>)
+# 用法：
+#   通用（任意第三方文件）：
+#     fr_patch_toggle_file(<开关变量> <文件绝对路径> <标签> <展示名> <锚点> <替换文本> [<文档指针>])
+#   pupnp 便捷包装（相对 third_party/pupnp 的路径）：
+#     fr_pupnp_patch_toggle(<开关变量> <相对路径> <锚点> <替换文本>)
+#
+# v0.6.0（d242）从 pupnp 专用泛化而来 —— 内嵌 AirPlay 的收件箱补丁要打 UxPlay 的
+# httpd.c，同一个引擎两处复用。pupnp 侧的调用与日志文案保持原样（回归无感）。
 #
 # 换行处理：pupnp 源码是 CRLF，而 CMake 里书写多行锚点只能用 LF
 #   ⇒ 匹配前把整份文件归一为 LF，写回时再按原样式还原（CRLF），
 #     这样锚点写法与文件实际内容无关，也不会把文件改动扩大化。
-function(fr_pupnp_patch_toggle enable rel anchor replacement)
-  set(_f "${FR_ROOT}/third_party/pupnp/${rel}")
+function(fr_patch_toggle_file enable abs_path label detail anchor replacement)
+  set(_hint "请对照相关 *_PLAN.md 更新锚点，或 tools/fetch_deps.sh 重拉干净源码。")
+  if (ARGC GREATER 6)
+    set(_hint "请对照 ${ARGV6} 更新锚点，或 tools/fetch_deps.sh 重拉干净源码。")
+  endif()
+
+  set(_f "${abs_path}")
   if (NOT EXISTS "${_f}")
-    message(FATAL_ERROR "[FlashRec] pupnp 锚点补丁：找不到 ${rel}")
+    message(FATAL_ERROR "[FlashRec] ${label}：找不到 ${detail}（${_f}）")
   endif()
 
   file(READ "${_f}" _raw)
@@ -43,7 +55,7 @@ function(fr_pupnp_patch_toggle enable rel anchor replacement)
     set(_to "${replacement}")
     set(_what "应用")
     if (NOT _patched EQUAL -1)
-      message(STATUS "[FlashRec] pupnp 锚点补丁：已是补丁后状态，跳过 ${rel}")
+      message(STATUS "[FlashRec] ${label}：已是补丁后状态，跳过 ${detail}")
       return()
     endif()
   else()
@@ -51,7 +63,7 @@ function(fr_pupnp_patch_toggle enable rel anchor replacement)
     set(_to "${anchor}")
     set(_what "还原")
     if (_patched EQUAL -1)
-      message(STATUS "[FlashRec] pupnp 锚点补丁：本就未打补丁，跳过 ${rel}")
+      message(STATUS "[FlashRec] ${label}：本就未打补丁，跳过 ${detail}")
       return()
     endif()
   endif()
@@ -65,13 +77,13 @@ function(fr_pupnp_patch_toggle enable rel anchor replacement)
 
   if (_hits EQUAL 0)
     message(FATAL_ERROR
-      "[FlashRec] pupnp 锚点补丁${_what}失败：锚点未命中 ${rel}\n"
+      "[FlashRec] ${label}${_what}失败：锚点未命中 ${detail}\n"
       "  待替换文本：${_from}\n"
-      "  libupnp 源码结构可能已变化（或源码树处于半补丁状态）——\n"
-      "  请对照 MULTI_NIC_PLAN.md §3 更新锚点，或 tools/fetch_deps.sh 重拉干净源码。")
+      "  源码结构可能已变化（或源码树处于半补丁状态）——\n"
+      "  ${_hint}")
   elseif (NOT _hits EQUAL 1)
     message(FATAL_ERROR
-      "[FlashRec] pupnp 锚点补丁${_what}失败：待替换文本不唯一 ${rel}"
+      "[FlashRec] ${label}${_what}失败：待替换文本不唯一 ${detail}"
       "（命中 ${_hits} 次，要求 1 次）\n"
       "  待替换文本：${_from}\n"
       "  请把锚点写得更具体（多带邻近行）后再构建，避免误伤无关代码。")
@@ -85,5 +97,16 @@ function(fr_pupnp_patch_toggle enable rel anchor replacement)
     string(REPLACE "\n" "${_nl}" _out "${_out}")
   endif()
   file(WRITE "${_f}" "${_out}")
-  message(STATUS "[FlashRec] pupnp 锚点补丁：已${_what} ${rel}")
+  message(STATUS "[FlashRec] ${label}：已${_what} ${detail}")
+endfunction()
+
+# pupnp 专用薄包装：保持 v0.5.0 起的调用签名与日志文案不变。
+function(fr_pupnp_patch_toggle enable rel anchor replacement)
+  fr_patch_toggle_file(${enable}
+    "${FR_ROOT}/third_party/pupnp/${rel}"
+    "pupnp 锚点补丁"
+    "${rel}"
+    "${anchor}"
+    "${replacement}"
+    "MULTI_NIC_PLAN.md §3")
 endfunction()

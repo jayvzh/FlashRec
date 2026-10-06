@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 # 版本号是打包的唯一来源（deb 文件名 / CPack 元数据 / .desktop）；改版本先改这里，
 # 且必须与 ledger/INDEX.md 中状态为「进行中」的版本一致。
-project(FlashRec VERSION 0.5.3 LANGUAGES C CXX)
+project(FlashRec VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,6 +72,11 @@ else()
   endif()
 endif()
 
+if (FR_AIRPLAY)
+  # 内嵌 AirPlay（v0.6.0）：适配器源码由 cmake/uxplay.cmake 导出，OFF 时列表为空。
+  list(APPEND FR_SOURCES ${FR_AIRPLAY_SOURCES})
+endif()
+
 if (FLASHREC_CONSOLE)
   add_executable(flashrec ${FR_SOURCES})
 else()
@@ -94,6 +99,12 @@ endif()
 # 版本号下发（d99）：main.cpp 的启动横幅与 UI 元信息都取它，避免再出现
 # "project(VERSION) 是 0.4.0、启动日志却写死 v0.3.1" 这种双真值。
 target_compile_definitions(flashrec PRIVATE FLASHREC_VERSION="${PROJECT_VERSION}")
+
+if (FR_AIRPLAY)
+  # main.cpp 里的 AirPlay 装配/主循环/退出序列全包在 #ifdef FR_AIRPLAY 内；
+  # 不开关时那段代码根本不编译，因此默认产物与纯 DMR 完全一致。
+  target_compile_definitions(flashrec PRIVATE FR_AIRPLAY)
+endif()
 
 if (MSVC)
   target_compile_options(flashrec PRIVATE /utf-8 /W3 /permissive- /Zi)
@@ -125,6 +136,10 @@ target_link_libraries(flashrec PRIVATE
   ${UPNP_LIBS}
   ${MPV_LIBRARY}
 )
+if (FR_AIRPLAY)
+  # 链接顺序：flashrec ← cast/*.cpp ← uxplay_airplay ← OpenSSL::Crypto plist pthread
+  target_link_libraries(flashrec PRIVATE uxplay_airplay)
+endif()
 if (WIN32)
   target_link_libraries(flashrec PRIVATE
     opengl32 gdi32 shell32 comctl32 dwmapi user32 ws2_32 iphlpapi winmm dbghelp
@@ -148,6 +163,15 @@ if (WIN32)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${MPV_DLL} $<TARGET_FILE_DIR:flashrec>
     COMMENT "copy libmpv-2.dll"
   )
+  if (FR_AIRPLAY)
+    # OpenSSL/libplist DLL 清单由 cmake/uxplay.cmake 导出 —— 打包侧同一份清单。
+    foreach (FR_DLL IN LISTS FR_AIRPLAY_DLLS)
+      add_custom_command(TARGET flashrec POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FR_DLL} $<TARGET_FILE_DIR:flashrec>
+        COMMENT "copy ${FR_DLL}"
+      )
+    endforeach()
+  endif()
 endif()
 
 # assets 跟随 exe（便携布局）
@@ -164,6 +188,9 @@ add_custom_command(TARGET flashrec POST_BUILD
 if (WIN32)
   install(TARGETS flashrec RUNTIME DESTINATION .)
   install(FILES ${MPV_DLL} DESTINATION .)
+  if (FR_AIRPLAY)
+    install(FILES ${FR_AIRPLAY_DLLS} DESTINATION .)  # libcrypto-3-x64.dll / plist-2.0.dll
+  endif()
   # 便携布局：exe + libmpv-2.dll + assets/ 同目录，解压即用（tools/package_windows.sh 直接
   # 用这条规则出 ZIP，不手工罗列文件 —— 手工列表迟早和这里漂移）。
   # 与 UNIX 分支同样排除两样「不该进包」的东西：

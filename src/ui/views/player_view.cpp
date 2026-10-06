@@ -1,7 +1,9 @@
 #include "ui/views/player_view.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <nanovg.h>
 
@@ -54,8 +56,26 @@ void draw_player_view(NVGcontext* vg, const Theme& t, float w, float h,
         text(vg, t, bx + L.badgePadX, L.topBarH * 0.5f, L.badgeFont, t.badgeText, s);
         bx += bw + L.badgeMarginL;
       };
-      // 来源徽章（M1 固定文案；来源 App 识别 = M2，从 User-Agent/DIDL 解析）
-      if (!snap.metadata.empty()) badge("DLNA 投屏");
+      // 来源徽章（d310：按会话来源切文案 —— 此前判「metadata 非空」且文案写死
+      // "DLNA 投屏"，AirPlay 会话（无 DIDL）永远没有协议徽章；规格见
+      // AIRPLAY_EMBED_PLAN.md:172。保持期（has_session）沿用最后一会话的来源）
+      if (snap.has_session) {
+        if (snap.source == CastSource::AirPlay)
+          badge("AirPlay 投屏");
+        else
+          badge("DLNA 投屏");
+      }
+      // d310：解码方式徽章（标题栏常驻、无任何开关；与「媒体信息」面板是两回事）。
+      // 空 = 取不到不画不猜；"no" = 软解；其余 = 硬解 + 后端名（如 d3d11va）。
+      if (in.hwdec[0] != '\0') {
+        if (std::strcmp(in.hwdec, "no") == 0) {
+          badge("软解");
+        } else {
+          char hb[48];
+          snprintf(hb, sizeof(hb), "硬解 %s", in.hwdec);
+          badge(hb);
+        }
+      }
       // d124：软件渲染兜底提示 —— 让用户知道"画面是 CPU 出的、硬件加速没生效"，
       // 而不是看不出区别（老显卡驱动编译不了 mpv 的 GLSL 时会自动降级到这条路）
       if (in.sw_video) badge("软件渲染");

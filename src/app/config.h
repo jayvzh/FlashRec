@@ -43,6 +43,21 @@ struct Config {
   bool player_muted = false;
   double player_speed = 1.0;  // d169：倍速持久化（player.speed，夹到 0.25..4.0）
 
+  // —— airplay（v0.6.0 d267；AIRPLAY_EMBED_PLAN.md §9 共 12+1 键；FR_AIRPLAY=OFF 时读取无效）——
+  bool airplay_enabled = true;        // airplay.enabled（编译开关关闭时无效）
+  std::string airplay_friendly_name;  // airplay.friendly_name（空=回退 dlna.friendly_name）
+  int airplay_rtsp_port = 0;          // airplay.rtsp_port（0=动态）
+  int airplay_mirror_port = 0;        // airplay.mirror_port（0=动态）
+  int airplay_udp_timing_port = 0;    // airplay.udp_timing_port（0=动态）
+  int airplay_udp_control_port = 0;   // airplay.udp_control_port（0=动态）
+  int airplay_udp_data_port = 0;      // airplay.udp_data_port（0=动态）
+  bool airplay_h265 = false;          // airplay.h265（features bit42，4K 镜像）
+  bool airplay_hls = false;           // airplay.hls（视频 URL 投送，M3 开）
+  bool airplay_pin_auth = false;      // airplay.pin_auth（PIN 配对开关）
+  std::string airplay_password;       // airplay.password（空 / 固定口令 / "pin"=随机 PIN）
+  int airplay_feedback_timeout_sec = 15;  // airplay.feedback_timeout_sec（心跳看门狗）
+  bool log_airplay_inbox = false;     // log.airplay_inbox（收件箱诊断，出厂关）
+
   static Config load(const std::string& path);
   // GetProtocolInfo 的 Sink 串（每行带 DLNA.ORG_OP=01;DLNA.ORG_CI=0）
   std::string sink_protocol_info() const;

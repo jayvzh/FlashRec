@@ -233,8 +233,13 @@ void draw_bottom_bar(NVGcontext* vg, const Theme& t, float w, float h,
   // 加裁剪反而引入"裁剪区算错 → 整条底栏连按钮一起消失"的风险（d17 踩过）。
 
   // —— 播放 / 暂停（媒体类：无会话禁用）——
+  // ★d318：AirPlay 镜像为直播流——实测其中途不发关键帧（ts_dump 65.3s 仅会话
+  //   首帧 1 个 IDR），暂停后恢复无法回到当前画面（解码器中途接入不可解）。
+  //   暂停按钮对 AirPlay 会话**禁用**（灰显、不可点）；DLNA URL 播放流不受影响。
+  const bool pause_forbidden = snap.source == CastSource::AirPlay;
   {
-    BtnState st = button_hit(in.btns, kBtnPlay, hit.play, media_enabled, in.down, in.dt, t);
+    BtnState st = button_hit(in.btns, kBtnPlay, hit.play,
+                             media_enabled && !pause_forbidden, in.down, in.dt, t);
     const float k = round_btn_bg(vg, t, g.btnPlayX, cy, L.btnHit, st);
     const NVGcolor ic = btn_icon_color(t, st);
     if (paused)
@@ -308,10 +313,17 @@ void draw_bottom_bar(NVGcontext* vg, const Theme& t, float w, float h,
   }
 
   // —— 倍速（d169，媒体类：无会话禁用；点击弹出档位列表，列表绘制在 render_loop）——
+  // ★d322：AirPlay 会话禁用用户倍速 —— 直播流的倍速由**追赶控制器**接管
+  //  （积压>阈值自动加速消费、追平回 1.0，见 player_controller），用户档位与
+  //  控制器冲突。DLNA 不受影响（d169 语义不变）。AirPlay→DLNA 切换时本门控
+  //  每帧按 snap.source 重算 ⇒ 按钮自动恢复可用。
+  const bool speed_forbidden = snap.source == CastSource::AirPlay;
   {
-    BtnState st = button_hit(in.btns, kBtnSpeed, hit.speed, media_enabled, in.down, in.dt, t);
+    BtnState st = button_hit(in.btns, kBtnSpeed, hit.speed,
+                             media_enabled && !speed_forbidden, in.down, in.dt, t);
     const float k = pill_btn_bg(vg, t, g.speedX, cy, L.speedW, L.btnBoxW, st);
-    const NVGcolor col = media_enabled ? btn_icon_color(t, st) : t.iconDisabled;
+    const NVGcolor col =
+        (media_enabled && !speed_forbidden) ? btn_icon_color(t, st) : t.iconDisabled;
     text(vg, t, g.speedX, cy, L.speedFont * k, col, format_speed(snap.speed).c_str(),
          NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
     if (st.clicked && cb.on_speed) cb.on_speed();

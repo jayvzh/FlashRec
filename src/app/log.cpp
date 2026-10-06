@@ -38,7 +38,9 @@ void init_logger(const std::string& dir, const std::string& level, bool with_con
         spdlog::async_overflow_policy::block);
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     logger->set_level(spdlog::level::from_str(level));
-    logger->flush_on(spdlog::level::warn);  // WARN+ 立即 flush
+    // d269：flush 提到 INFO —— AirPlay 真机取证（M1/M2 音视频证据全在 INFO 层）
+    // 曾因 warn 才刷盘而"日志缺失"误判死锁；本应用日志量低（个位数/秒），无性能虞。
+    logger->flush_on(spdlog::level::info);  // INFO+ 立即 flush
     spdlog::set_default_logger(logger);
     FR_LOG_INFO("[APP] 日志初始化完成 dir={} level={} console={}", dir, level, with_console);
   } catch (const std::exception& e) {

@@ -50,23 +50,37 @@ fi
 # Linux 走系统包（libssl-dev / libplist-dev），由 workflow「Install build deps」负责。
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
+    # uxplay.cmake 需要两处：installed 前缀（openssl/libplist）+ buildtrees 里的
+    # openssl ms/applink.c（OPENSSL_Applink，缺了启动即崩，见 uxplay.cmake:305-315）。
+    APPLINK_LOCAL="$(ls third_party/vcpkg/buildtrees/openssl/src/*/ms/applink.c 2>/dev/null | head -1)"
     if [ -f third_party/vcpkg/installed/x64-windows/include/openssl/ssl.h ] \
-       && [ -f third_party/vcpkg/installed/x64-windows/lib/plist-2.0.lib ]; then
-      echo "[skip] vcpkg openssl+libplist 已存在" | tee -a "$LOG"
+       && [ -f third_party/vcpkg/installed/x64-windows/lib/plist-2.0.lib ] \
+       && [ -n "$APPLINK_LOCAL" ]; then
+      echo "[skip] vcpkg openssl+libplist+applink 已存在" | tee -a "$LOG"
     else
       VK="$(command -v vcpkg || true)"
       [ -z "$VK" ] && [ -n "${VCPKG_INSTALLATION_ROOT:-}" ] && VK="$VCPKG_INSTALLATION_ROOT/vcpkg"
       if [ -z "$VK" ] || [ ! -x "$VK" ]; then
         echo "[FAIL] 找不到 vcpkg（PATH 或 VCPKG_INSTALLATION_ROOT），无法装 openssl/libplist" | tee -a "$LOG"
       else
+        VROOT="$(cd "$(dirname "$VK")" && pwd)"
         echo "[vcpkg] $VK install openssl libplist (x64-windows)" | tee -a "$LOG"
         "$VK" install openssl:x64-windows libplist:x64-windows --no-print-usage >>"$LOG" 2>&1
-        SRCI="$(dirname "$VK")/installed/x64-windows"
-        [ -d "$SRCI" ] || SRCI="${VCPKG_INSTALLATION_ROOT:-}/installed/x64-windows"
+        SRCI="$VROOT/installed/x64-windows"
         if [ -f "$SRCI/include/openssl/ssl.h" ] && [ -f "$SRCI/lib/plist-2.0.lib" ]; then
           mkdir -p third_party/vcpkg/installed/x64-windows
           cp -r "$SRCI/include" "$SRCI/lib" "$SRCI/bin" third_party/vcpkg/installed/x64-windows/ 2>>"$LOG"
-          echo "[ok] vcpkg openssl+libplist" | tee -a "$LOG"
+          # applink.c：从 vcpkg 的 openssl buildtrees 源码树取（uxplay.cmake 按该路径 glob）
+          APPLINK_SRC="$(ls "$VROOT"/buildtrees/openssl/src/*/ms/applink.c 2>/dev/null | head -1)"
+          if [ -n "$APPLINK_SRC" ]; then
+            mkdir -p third_party/vcpkg/buildtrees/openssl/src/fr-fetch-shim/ms
+            cp "$APPLINK_SRC" third_party/vcpkg/buildtrees/openssl/src/fr-fetch-shim/ms/applink.c
+          fi
+          if [ -n "$(ls third_party/vcpkg/buildtrees/openssl/src/*/ms/applink.c 2>/dev/null | head -1)" ]; then
+            echo "[ok] vcpkg openssl+libplist+applink" | tee -a "$LOG"
+          else
+            echo "[FAIL] installed 已拷但 applink.c 缺（buildtrees 被清理？），日志尾部：" | tee -a "$LOG"; tail -25 "$LOG"
+          fi
         else
           echo "[FAIL] vcpkg 装完仍缺 ssl.h/plist-2.0.lib，日志尾部：" | tee -a "$LOG"; tail -25 "$LOG"
         fi

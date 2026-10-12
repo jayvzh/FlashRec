@@ -876,6 +876,13 @@ int main(int argc, char** argv) {
     // 无条件 publish 兜底出画；调用点在 publish_only 之后改动的路径同样被覆盖）。
     publish_wake();
   };
+  // ★d322：全屏切换的统一出口 —— 给 F 与 Ctrl+Enter 共用，保证 OSD 反馈与
+  // 状态同步路径只有一份（原先 Ctrl+Enter 自己内联，再叠一个 F 就得抄第二遍）。
+  // 它跑在主线程（on_key / exec_intent 都在主线程），里面没有跨线程动作。
+  auto toggle_fullscreen_ui = [&]() {
+    window.toggle_fullscreen();
+    show_osd(3, window.fullscreen() ? 3 : 4);   // d32：全屏动作反馈
+  };
   auto play_pause = [&]() {
     PlaybackSnapshot s = bus.snapshot();
     DmrCommand c;
@@ -916,7 +923,8 @@ int main(int argc, char** argv) {
   //   ① stage 不含顶栏（render_loop d214：窗口模式下视频从顶栏下缘开始）⇒ 窗口要加一个 topBarH；
   //   ② 一个视频像素 = 一个**物理**像素 ⇒ 逻辑尺寸 = 视频尺寸 / contentScale；
   //   ③ 超过所在屏工作区就等比夹取，不让它溢出到看不见的地方。
-  auto apply_video_scale = [&](double pct) {
+  // quiet = true 用于「投屏开始自动摆窗」：不弹 OSD，免得盖住刚出来的「投屏中」提示。
+  auto apply_video_scale = [&](double pct, bool quiet = false) {
     if (pip_mode) return;   // 小窗尺寸本就固定，不参与倍率缩放（避免与进入前的置顶真值互噬）
     int vw = 0, vh = 0;
     if (!player.video_size(&vw, &vh)) {
@@ -957,6 +965,7 @@ int main(int argc, char** argv) {
     window.center_on_workarea();   // 尺寸已落，按实测值居中（平台可能更正过请求尺寸）
     FR_LOG_INFO("[WIN] 窗口缩放 {}%：视频 {}x{} → stage {}x{} + 顶栏 {:.0f}",
                 (int)(pct * 100 + 0.5), vw, vh, lw, (int)std::lround(stage_h), (double)top);
+    if (quiet) return;
     const int osd_id = pct <= 0.75 ? 8 : pct <= 1.25 ? 9 : pct <= 1.75 ? 10 : 11;
     show_osd(3, osd_id);
   };
@@ -1020,12 +1029,23 @@ int main(int argc, char** argv) {
       case GLFW_KEY_2: case GLFW_KEY_KP_2: apply_video_scale(1.0); break;  // 100%
       case GLFW_KEY_3: case GLFW_KEY_KP_3: apply_video_scale(1.5); break;  // 150%
       case GLFW_KEY_4: case GLFW_KEY_KP_4: apply_video_scale(2.0); break;  // 200%
+      // ★d322：F = 全屏切换。约定只在"无修饰键"时生效，避免以后给 Ctrl+F / Alt+F
+      // 留位时被抢。与 Ctrl+Enter 是同一个出口，行为完全一致。
+      case GLFW_KEY_F:
+        if (mods == 0) toggle_fullscreen_ui();
+        break;
+      // ★d322：T = 窗口置顶切换。走与右上角图钉钮**同一个意图**（TogglePin）——
+      // 不去直接调 window.set_floating()，免得"按钮点"和"按键按"各维护一份状态；
+      // 置顶真值只有一处：window.floating()，由 exec_intent 统一翻转 + 弹 OSD。
+      case GLFW_KEY_T:
+        if (mods == 0) {
+          channel.post_intent(UiIntent{UiIntent::Kind::TogglePin});
+          publish_wake();
+        }
+        break;
       case GLFW_KEY_ENTER:
       case GLFW_KEY_KP_ENTER:
-        if (mods & GLFW_MOD_CONTROL) {
-          window.toggle_fullscreen();
-          show_osd(3, window.fullscreen() ? 3 : 4);   // d32：全屏动作反馈
-        }
+        if (mods & GLFW_MOD_CONTROL) toggle_fullscreen_ui();
         break;
       case GLFW_KEY_ESCAPE:
         // 全屏 / 画中画态：ESC = 回窗口模式（d29 用户定值）；普通窗口态仍为关闭
@@ -1489,6 +1509,11 @@ int main(int argc, char** argv) {
   //     → P3 显示 → P4 自动全屏；P5 记忆写回在主循环几何去抖段 + 退出兜底）——
   std::string cast_last_uri;   // 上次管线触发的 URI（去 #fragment）
   double cast_last_at = -1e9;
+  // ★d322：投屏开始后是否还欠一次「自动缩放到 100%」。
+  // CastEvent 是 SetURI 时发的，那一刻 mpv 还没 file-loaded ⇒ video_size() 拿不到有效值，
+  // 直接缩放必然被"无有效尺寸"挡掉。故这里挂起，由主循环在尺寸就绪的那一帧补做。
+  bool cast_fit_pending = false;
+  double cast_fit_deadline = 0.0;
   auto run_cast_pipeline = [&](const CastEvent& ce) {
     const double tnow = mono_now();
     const size_t frag = ce.uri.find('#');
@@ -1528,8 +1553,15 @@ int main(int argc, char** argv) {
       apply_placement(window, *target, mem_for(cfg, target->fp));
     }
     ensure_window_shown(window);  // P3：显窗无条件（R3）；面板不弹（d36 语义保持）
-    if (cfg.ui_cast_auto_fullscreen && !window.fullscreen())
+    if (cfg.ui_cast_auto_fullscreen && !window.fullscreen()) {
       window.enter_fullscreen_on(target->idx);  // P4：已在目标屏全屏 = no-op（不闪屏）
+      cast_fit_pending = false;   // ★d322：全屏态不做窗口缩放（别把人从全屏里踢出来）
+    } else if (!window.fullscreen()) {
+      // ★d322：不自动全屏时，等视频显示尺寸一到就把窗口缩到 100%（等价于按数字键 2）。
+      // 挂起而非立刻执行：见上面 cast_fit_pending 声明处的说明（URI 时刻还没 file-loaded）。
+      cast_fit_pending = true;
+      cast_fit_deadline = mono_now() + 3.0;   // 3s 拿不到就不再等，避免下次恢复播放时抢窗口
+    }
     publish_wake();  // d47：显窗/形态变化必须自行发布+唤醒
     FR_LOG_INFO("[CAST] 目标屏 {}（{}×{}）摆位完成", target->idx, target->w, target->h);
   };
@@ -1604,6 +1636,20 @@ int main(int argc, char** argv) {
       player.set_stage_aspect(sh > 1.0 ? sw / sh : 0.0);
     }
     player.tick(now);
+    // 2.5) ★d322：新会话自动缩放到视频 100%（等价按数字键 2）。
+    // 挂起的原因：CastEvent 在 SetURI 时就发，那一刻 mpv 还没 file-loaded，
+    // video_size() 取不到有效值 ⇒ 只能在后续帧里等尺寸就绪再补做一次。
+    // 「只做一次」是硬要求：恢复播放 / seek 不该重排窗口，用户手动改过也不该被抢回去。
+    if (cast_fit_pending) {
+      int vw = 0, vh = 0;
+      if (player.video_size(&vw, &vh)) {
+        apply_video_scale(1.0, /*quiet=*/true);
+        cast_fit_pending = false;
+      } else if (mono_now() - cast_fit_deadline >= 0.0) {
+        FR_LOG_WARN("[CAST] 等视频显示尺寸超时 ⇒ 放弃本次自动 100% 缩放");
+        cast_fit_pending = false;
+      }
+    }
     // 3) DMR 差量 NOTIFY
     dmr.tick();
 #ifdef FR_AIRPLAY

@@ -232,8 +232,12 @@ CRT_DIR=""
 # 少一级会落到 VC/Tools，那里根本没有 Redist —— 症状是"静默跳过运行库"。
 vc_root="$(cd "$FR_MSVC/../../.." 2>/dev/null && pwd || true)"
 if [ -n "$vc_root" ]; then
-  # redist 目录名带版本号（14.44.35112），会随 VS 更新变 ⇒ glob 取版本最大的那个
-  CRT_DIR="$(ls -1d "$vc_root"/Redist/MSVC/*/x64/Microsoft.VC143.CRT 2>/dev/null | sort -V | tail -1 || true)"
+  # redist 目录名带版本号（14.44.35112），会随 VS 更新变 ⇒ glob 取版本最大的那个。
+  # ⚠️ CRT 目录名**跟着工具集大版本走**：17.9~ 是 Microsoft.VC143.CRT，
+  # 17.14+（MSVC 14.51 / v145）是 Microsoft.VC145.CRT。写死 VC143 的话，
+  # 在新工具集机器上会静默走"跳过运行库"分支 —— 出的包在精简系统/LTSC 上起不来
+  # （本机 14.51.36231 实测踩到，故这里用 VC14* 通配）。
+  CRT_DIR="$(ls -1d "$vc_root"/Redist/MSVC/*/x64/Microsoft.VC14*.CRT 2>/dev/null | sort -V | tail -1 || true)"
 fi
 if [ -n "$CRT_DIR" ] && [ -d "$CRT_DIR" ]; then
   ncrt=0

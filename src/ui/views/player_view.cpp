@@ -47,7 +47,7 @@ void draw_player_view(NVGcontext* vg, const Theme& t, float w, float h,
       float bx = L.topBarPadL + L.titleTextGap +
                  std::min(w * L.titleMaxRatio, text_width(vg, L.titleFont, snap.title.c_str())) +
                  L.titleIconGap + L.badgeMarginL;
-      const float bx_limit = w - 3 * L.winBtnW - 6;
+      const float bx_limit = w - kTopRightBtns * L.winBtnW - 6;
       auto badge = [&](const char* s) {
         const float bw = text_width(vg, L.badgeFont, s) + L.badgePadX * 2;
         if (bx + bw >= bx_limit) return;

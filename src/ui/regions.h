@@ -82,7 +82,7 @@ struct UiRegions {
   DmgRect skin_menu;    // d182 皮肤弹层（render_loop 出帧路径用 skin_lay 补填）
   DmgRect prompt_bar;   // d74 剪贴板链接提示条横幅
   // —— 控件级（P1/P3 归因粒度）——
-  DmgRect win_btn[3];             // 顶栏三键热区
+  DmgRect win_btn[kTopRightBtns];  // 顶栏按钮组热区（★d322：置顶 + 三键，共 4 个）
   DmgRect skin_btn;               // d182：顶栏皮肤按钮热区
   DmgRect bar_btn[kBtnIdCount];   // 底栏按钮热区（媒体类无会话时仍给几何，归因门控）
   DmgRect track, time_cur, time_left;

@@ -351,6 +351,20 @@ double MpvBridge::video_aspect() {
   return (a > 0.01 && a < 100.0) ? a : 0.0;
 }
 
+// ★d322：视频显示尺寸（含 PAR 修正）。取不到/无视频/离谱值返回 false —— 判定侧据此跳过。
+// 与 video_aspect 同源（video-params），两者一致性由同一份文档约定保证；
+// 退出有效的必要条件是 dw/dh 都在合理区间（见过 0/负数/离谱大的脏值）。
+bool MpvBridge::video_size(int* dw, int* dh) {
+  if (!mpv_ || !dw || !dh) return false;
+  int64_t w = 0, h = 0;
+  if (mpv_get_property(mpv_, "video-params/dw", MPV_FORMAT_INT64, &w) < 0) return false;
+  if (mpv_get_property(mpv_, "video-params/dh", MPV_FORMAT_INT64, &h) < 0) return false;
+  if (w < 16 || h < 16 || w > 65536 || h > 65536) return false;
+  *dw = (int)w;
+  *dh = (int)h;
+  return true;
+}
+
 void MpvBridge::load_uri(const std::string& uri, double start_sec,
                          const std::string& load_format) {  if (!mpv_) return;
   // d184：每次加载应用视频填充（cover=1/contain=0；等价 CSS object-fit）

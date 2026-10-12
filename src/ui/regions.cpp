@@ -149,9 +149,9 @@ UiRegions compute_regions(NVGcontext* vg, const Theme& t, float w, float h,
   // 可见性：只在暂停态绘制（player_view），画中画无 chrome（d57 同口径）
   R.center_visible = snap.state == TransportState::PausedPlayback && !pip;
 
-  // 顶栏三键
-  for (int i = 0; i < 3; i++) {
-    const float bx = w - (float)(3 - i) * L.winBtnW;
+  // 顶栏按钮组（★d322：置顶 + 三键；i 从左到右，与 draw_win_buttons 同一套排序）
+  for (int i = 0; i < kTopRightBtns; i++) {
+    const float bx = w - (float)(kTopRightBtns - i) * L.winBtnW;
     R.win_btn[i] = DmgRect{dm(bx), 0, dm(L.winBtnW), dm(L.topBarH)};
   }
   // d182：顶栏皮肤按钮
@@ -178,9 +178,14 @@ UiRegions compute_regions(NVGcontext* vg, const Theme& t, float w, float h,
       DmgRect{dm(g.speedX - L.speedW * 0.5f), dm(y0), dm(L.speedW), dm(bh)};
   R.bar_btn[kBtnPip] = DmgRect{dm(g.pipX - hs), dm(y0), dm(L.btnHit), dm(bh)};
   R.bar_btn[kBtnFullscreen] = DmgRect{dm(g.fsX - hs), dm(y0), dm(L.btnHit), dm(bh)};
-  R.bar_btn[kBtnWinMin] = R.win_btn[0];
-  R.bar_btn[kBtnWinMax] = R.win_btn[1];
-  R.bar_btn[kBtnWinClose] = R.win_btn[2];
+  // ★d322：三键 id → 热区下标。win_btn 按**从左到右**排为
+  //   [0]置顶 [1]最小化 [2]最大化 [3]关闭
+  // 加了最左的置顶钮后三键整体右移一格 —— 必须与 chrome::draw_win_buttons 的 i 排序同源，
+  // 否则按钮缓动会把脏区标到邻座的矩形上去（表现：悬停错位、残影）。
+  R.bar_btn[kBtnWinMin] = R.win_btn[1];
+  R.bar_btn[kBtnWinMax] = R.win_btn[2];
+  R.bar_btn[kBtnWinClose] = R.win_btn[3];
+  R.bar_btn[kBtnPin] = R.win_btn[0];     // 置顶钮（最左那个）
   R.bar_btn[kBtnCenterPlay] = R.center_play;
   R.track = DmgRect{dm(g.trackX), dm(g.cy - 8), dm(g.trackW), 16};
   R.time_cur = DmgRect{dm(g.timeCurX - 2), dm(y0), dm(timeW + 6), dm(bh)};

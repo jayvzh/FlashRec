@@ -704,6 +704,13 @@ void WindowGLFW::set_floating(bool on) {
   if (win_) glfwSetWindowAttrib(win_, GLFW_FLOATING, on ? GLFW_TRUE : GLFW_FALSE);
 }
 
+// ★d322：置顶真值回读（与 maximized() 完全同构：UI 侧读窗口属性，不另存第二份副本）。
+// 已知边界：Wayland 后端未实现 FLOATING（GLFW 报 FEATURE_UNAVAILABLE），此值恒 false
+// ⇒ 置顶钮在该后端表现为"点了不变形"，属平台能力缺失而非状态错乱。
+bool WindowGLFW::floating() const {
+  return win_ && glfwGetWindowAttrib(win_, GLFW_FLOATING) == GLFW_TRUE;
+}
+
 void WindowGLFW::set_window_size(int w, int h) {
   if (win_) glfwSetWindowSize(win_, w, h);
 }
@@ -756,6 +763,47 @@ void WindowGLFW::move_to_workarea_corner(int w, int h) {
   int ax, ay, aw, ah;
   glfwGetMonitorWorkarea(mon, &ax, &ay, &aw, &ah);
   glfwSetWindowPos(win_, ax + aw - w, ay + ah - h);
+}
+
+// —— d322：几何工具 —— 见头文件注释（单位口径 / 调用顺序的约束在那里）。
+void WindowGLFW::ensure_windowed() {
+  if (!win_) return;
+  if (glfwGetWindowAttrib(win_, GLFW_MAXIMIZED) == GLFW_TRUE) glfwRestoreWindow(win_);
+  // 全屏走 toggle_fullscreen：它把窗口还原到**进入全屏前的矩形**（fs_sx_..），
+  // 比直接 glfwSetWindowMonitor(mon=nullptr) 更符合用户预期（还原到原位再缩放）。
+  if (glfwGetWindowMonitor(win_) != nullptr) toggle_fullscreen();
+}
+
+void WindowGLFW::set_client_size_logical(int lw, int lh) {
+  if (!win_ || lw <= 0 || lh <= 0) return;
+  // 系数 = 「GLFW 屏幕坐标 / 逻辑尺寸」，现场自测。Windows：窗口尺寸==物理像素、
+  // 逻辑=物理/scale ⇒ 系数 = scale；X11/Wayland：两者互为 1。取不到时回落 1。
+  float unit = 1.f;
+  int ww = 0, wh = 0;
+  glfwGetWindowSize(win_, &ww, &wh);
+  const int lw_now = logical_width();
+  if (ww > 0 && lw_now > 0) unit = (float)ww / (float)lw_now;
+  set_window_size((int)std::lround((float)lw * unit), (int)std::lround((float)lh * unit));
+}
+
+void WindowGLFW::center_on_workarea() {
+  if (!win_) return;
+  int wx = 0, wy = 0, ww = 0, wh = 0;
+  glfwGetWindowPos(win_, &wx, &wy);
+  glfwGetWindowSize(win_, &ww, &wh);   // 用实测尺寸：Windows 可能已把请求值更正过
+  if (ww <= 0 || wh <= 0) return;
+  GLFWmonitor* mon = monitor_containing(wx + ww / 2, wy + wh / 2);
+  int ax = 0, ay = 0, aw = 0, ah = 0;
+  glfwGetMonitorWorkarea(mon, &ax, &ay, &aw, &ah);
+  if (aw <= 0 || ah <= 0) return;
+  // 目标比工作区大：夹左上角到工作区原点（≥ay/ax），宁可右下溢出也不让顶边出屏外
+  // —— 顶边出屏会把标题栏连同关闭键一起推到不可及的位置。
+  const int off_x = (aw > ww) ? (aw - ww) / 2 : 0;   // 窗口比工作区宽 → 不居中，贴左缘
+  const int off_y = (ah > wh) ? (ah - wh) / 2 : 0;
+  set_pos(ax + off_x, ay + off_y);
+  if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND)
+    FR_LOG_WARN("[UI] Wayland 后端不支持客户端定位窗口 → 尺寸已改，居中未生效（{}x{} 就地延展）",
+                ww, wh);
 }
 
 // d282：对齐 GLFWwindow* → 平台原生窗口句柄（Win32 侧 = HWND）。

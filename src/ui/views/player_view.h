@@ -1,6 +1,6 @@
 #pragma once
-// 播放态视图：IINA 排版（上下贴边半透明双栏 + idle 隐去 + 悬停进度缩略图）+ Windows 右上三键。
-// 底栏与三键由 ui/views/chrome 提供（与待机态**共用一份实现**）；本文件只管播放态特有部分：
+// 播放态视图：IINA 排版（上下贴边半透明双栏 + idle 隐去 + 悬停进度缩略图）+ 右上窗口按钮组。
+// 底栏与按钮组由 ui/views/chrome 提供（与待机态**共用一份实现**）；本文件只管播放态特有部分：
 // 顶栏标题 / 来源徽章、悬停缩略图浮层、中央大播放键。
 // 立即模式：draw 内完成 hit-test 与回调；控件动画状态由 ViewInput 持有。
 #include <functional>
@@ -40,6 +40,10 @@ struct ViewInput {
   bool fullscreen = false;       // 全屏态：顶栏任何情况不渲染（仅窗口模式渲染）
   bool maximized = false;        // 最大化中：Max 按钮显示"还原"图标
 
+  // ★d322：窗口已置顶（右上角图钉钮的刷外形依据）。主线程写真值，渲染线程只读
+  //（与 maximized 完全同构，且必须进 input_changed 归因表 —— 否则改了不出帧）。
+  bool pinned = false;
+
   // —— d74 剪贴板链接提示条（主线程写、渲染线程只读显示）——
   // 定长缓冲是平凡复制约束下的形态（ViewInput 整块 memcpy 跨线程）；URL 的
   // 业务真值在主线程（播放动作按主线程持有的 URL 执行），这里仅承载显示。
@@ -69,6 +73,7 @@ struct ViewInput {
 
 struct ViewCallbacks {
   std::function<void()> on_close, on_minimize, on_maximize;
+  std::function<void()> on_pin;  // d322：顶栏置顶钮（置顶状态切换，真值在主线程）
   std::function<void()> on_play_pause, on_prev, on_next, on_stop;  // d158：停止键（无上/下一集数据时）
   std::function<void()> on_pip, on_fullscreen;
   std::function<void()> on_speed;          // d169：倍速按钮点击（渲染线程切换档位弹层）

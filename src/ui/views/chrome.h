@@ -1,5 +1,5 @@
 #pragma once
-// 两态共用 chrome（顶栏右上角三键 + 底栏）。**必须只有一份实现** ——
+// 两态共用 chrome（顶栏右上角按钮组 + 底栏）。**必须只有一份实现** ——
 // 播放态与待机态各写一份、各自补交互，正是"同一个按钮两处行为不一致"的根因。
 //
 // 可见性与可用性是两个维度：
@@ -37,8 +37,16 @@ enum BtnId : int {
   kBtnClipPlay,     // d74：剪贴板提示条「播放」按钮（横幅隐藏时 d57 冻结值清理）
   kBtnClipIgnore,   // d74：剪贴板提示条「忽略」按钮
   kBtnSkin,         // d182：顶栏「皮肤按钮」
+  kBtnPin,          // d322：顶栏「窗口置顶」按钮（三键左侧第四个）
   kBtnIdCount
 };
+
+// ★d322：右上角按钮总数（原三键 + 置顶）。几何、命中、脏矩形、拖动区判定
+// **必须全部走这里** —— 原来各处散写着字面量 3，加一个钮就得改 6 处，漏一处
+// 就是「热区和画出来的位置对不上」。
+// ⚠️ 约束：ButtonFx::kMax = 16（widgets.h），kBtnIdCount 加完 kBtnPin 后恰好 16 = 满槽。
+//    再加新按钮必须先把 kMax 一起抬起来（ViewInput 仍可平凡复制，数组变大即可）。
+static constexpr int kTopRightBtns = 4;
 
 // 底栏是否被下方控件占用（仅一个"这位置归不归 chrome"的判定来源）。
 // consumed 比 any() 宽：它还要覆盖"媒体禁用位"与条上任意位置。
@@ -73,11 +81,13 @@ float center_play_radius(const Theme& t);
 float chrome_fade(NVGcontext* vg, const Theme& t, float w, float h, const PlaybackSnapshot& snap,
                   const ViewInput& in, bool media_enabled);
 
-// 右上角三键（热区各 winBtnW × topBarH，无缝排列）
+// 右上角按钮组（热区各 winBtnW × topBarH，无缝排列）。★d322 起是四键，
+// 从左到右依次为：置顶 │ 最小化 │ 最大化 │ 关闭。
+// 布局从左到右算，ButtonFx 槽位仍沿用 kBtnWinMin/Max/Close + kBtnPin。
 void draw_win_buttons(NVGcontext* vg, const Theme& t, float w, ViewInput& in, ViewCallbacks& cb,
                       const DmgRect* clip = nullptr);
 
-// —— d182：顶栏「皮肤按钮」（三键组左侧 skinBtnGap 处；绘制/命中同源）——
+// —— d182：顶栏「皮肤按钮」（按钮组左侧 skinBtnGap 处；绘制/命中同源）——
 struct SkinBtnGeom {
   float x = 0, y = 0, w = 0, h = 0;
 };
@@ -100,7 +110,7 @@ void draw_skin_menu(NVGcontext* vg, const Theme& t, const SkinMenuLayout& lay,
                     const std::vector<std::string>& names, int cur, int hover,
                     const DmgRect* clip = nullptr);
 
-// 顶栏是否被三键占用（拖动区判定 / 空白处判定用）。
+// 顶栏是否被右上角按钮组占用（拖动区判定 / 空白处判定用）。
 // 定义在此：只有一行矩形判定，无需单独 .cpp；Theme 完整定义由调用方 include 保证。
 inline bool topbar_hit(const Theme& t, float w, float mx, float my);
 
@@ -126,8 +136,8 @@ void draw_osd(NVGcontext* vg, const Theme& t, float w, float h, const PlaybackSn
               const ViewInput& in, const DmgRect* clip = nullptr);
 
 // —— 右键上下文菜单（d45）——
-// 独立于 ButtonFx/BtnId：菜单条目命中用自管下标，不占用按钮槽
-//（kMax=16 已被 10 个 BtnId 占用，菜单再挂进去就爆了）。
+// 独立于 ButtonFx/BtnId：菜单条目命中用自管下标，不占用按钮槽。
+//（★d322：kMax=16 现已被 16 个 BtnId **全部占满** —— 菜单挂进去必爆，这条纪律更紧了。）
 enum class CtxAction {
   None, PlayPause, Prev, Next, Stop, ToggleFullscreen, Pip,
   // d146 R5：三项信息徽章合并为一项；R2：新增投屏自动全屏（两项均勾选 + R1 持久化）。
@@ -189,7 +199,8 @@ void draw_speed_menu(NVGcontext* vg, const Theme& t, const SpeedMenuLayout& lay,
 
 namespace fr {
 inline bool topbar_hit(const Theme& t, float w, float mx, float my) {
-  return my >= 0.f && my < t.layout.topBarH && mx >= w - 3.f * t.layout.winBtnW;
+  return my >= 0.f && my < t.layout.topBarH &&
+         mx >= w - (float)kTopRightBtns * t.layout.winBtnW;
 }
 inline bool center_play_hit(const Theme& t, float w, float h, float mx, float my) {
   const float r = center_play_radius(t) * 0.5f;

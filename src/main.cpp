@@ -539,6 +539,7 @@ int main(int argc, char** argv) {
   bool pip_mode = false;
   bool pip_had_picture = false;                     // 小窗内出现过画面（消失则自动退回大窗）
   int pip_x = 0, pip_y = 0, pip_w = 0, pip_h = 0;   // 进入前窗口矩形
+  bool pip_pin_before = false;   // d322：进小窗前的**用户置顶真值**（退出时照此还原）
   constexpr int kPipW = 420, kPipH = 236;           // 16:9 小窗
   // 画中画的"单击恢复 vs 按住拖动"判定（d25，用户定的两条规则）：
   //   1. 弹起位置与按下位置相距 > kPipDragPx → 拖动意图（进入 OS 拖拽）；
@@ -884,6 +885,19 @@ int main(int argc, char** argv) {
     // d32：动作反馈 OSD（kind3：1=播放 2=暂停）
     show_osd(3, s.state == TransportState::Playing ? 2 : 1);
   };
+  // ★d322：窗口隐藏前暂停播放。
+  // 关窗的实际语义是「隐到托盘」（d81：托盘常驻、DMR 保持在线以便继续投屏），进程不退出
+  // ⇒ 画面锁在 mpv 里继续解码出声。窗口不可见却还在播不是预期状态：
+  // 只暂停播放 / 保留会话，投屏的连接与 URIs 不受影响（回来还是原来那条会话）。
+  // 只在 Playing 态发 Pause：已暂停/无会话时不打扰，也不碰 Stop（Stop 会进停止保持期）。
+  auto pause_if_playing = [&]() {
+    const PlaybackSnapshot s = bus.snapshot();
+    if (s.state != TransportState::Playing) return;
+    DmrCommand c;
+    c.type = DmrCommand::Type::Pause;
+    player.on_command(c);
+    FR_LOG_INFO("[APP] 窗口隐藏 ⇒ 播放暂停（DMR 会话保留，可继续投屏）");
+  };
   auto nudge_volume = [&](int delta) {
     PlaybackSnapshot s = bus.snapshot();
     int v = s.volume + delta;
@@ -895,6 +909,56 @@ int main(int argc, char** argv) {
     c.volume = v;
     player.on_command(c);
     show_osd(1, v);           // d28：音量 OSD（键/滚轮/拖拽释放共用）
+  };
+  // ★d322：窗口按视频原始尺寸缩放（PotPlayer 语义：1/2/3/4 = 50%/100%/150%/200%）。
+  // 只管"目标怎么算"，物理单位换算 / 退全屏 / 居中都在 window 层（见 window_glfw 注释）。
+  // 三条口径不能动：
+  //   ① stage 不含顶栏（render_loop d214：窗口模式下视频从顶栏下缘开始）⇒ 窗口要加一个 topBarH；
+  //   ② 一个视频像素 = 一个**物理**像素 ⇒ 逻辑尺寸 = 视频尺寸 / contentScale；
+  //   ③ 超过所在屏工作区就等比夹取，不让它溢出到看不见的地方。
+  auto apply_video_scale = [&](double pct) {
+    if (pip_mode) return;   // 小窗尺寸本就固定，不参与倍率缩放（避免与进入前的置顶真值互噬）
+    int vw = 0, vh = 0;
+    if (!player.video_size(&vw, &vh)) {
+      FR_LOG_INFO("[WIN] 无有效视频显示尺寸 → 跳过 {}% 缩放", (int)(pct * 100 + 0.5));
+      return;
+    }
+    const float s = window.content_scale();
+    if (s < 0.01f) return;
+    const float ds = window.dip_scale();   // GLFW 单位 → 逻辑；两者换算全靠它，不猜平台
+    if (ds < 0.001f || ds > 1000.f) return;   // 拿不到换算系数就别动窗口（宁可不动，不能乱设）
+    const float top = theme.layout.topBarH;
+
+    // —— 目标 stage（逻辑）——
+    float stage_w = (float)((double)vw * pct / (double)s);
+    float stage_h = (float)((double)vh * pct / (double)s);
+    // 最小保护：再小的窗口照样会把三键挤成一团，且 Windows 侧还有 minimum track size
+    constexpr float kMinStageW = 320.f, kMinStageH = 180.f;
+    const float need = std::max(kMinStageW / stage_w, kMinStageH / stage_h);
+    if (need > 1.f) { stage_w *= need; stage_h *= need; }   // 等比放大到够大为止
+    // 工作区夹取（等比）：屏幕上可用的高度还要先扣掉顶栏
+    int mon = window.monitor_index_of_window();
+    MonitorInfo mi{};
+    if (mon >= 0 && WindowGLFW::monitor_info(mon, &mi) && mi.aw > 0 && mi.ah > 0) {
+      const float avail_w = (float)mi.aw * ds;
+      const float avail_h = (float)mi.ah * ds - top;
+      if (stage_w > avail_w || stage_h > avail_h) {
+        const float k = std::min(avail_w / stage_w, avail_h / stage_h);
+        stage_w *= k;
+        stage_h *= k;
+      }
+    }
+
+    // 最大化 / 全屏态下改尺寸会被静默忽略 ⇒ 先回普通窗口（顺序：最大化 → 全屏）
+    window.ensure_windowed();
+    const int lw = (int)std::lround(stage_w);
+    const int lh = (int)std::lround(stage_h + top);
+    window.set_client_size_logical(lw, lh);
+    window.center_on_workarea();   // 尺寸已落，按实测值居中（平台可能更正过请求尺寸）
+    FR_LOG_INFO("[WIN] 窗口缩放 {}%：视频 {}x{} → stage {}x{} + 顶栏 {:.0f}",
+                (int)(pct * 100 + 0.5), vw, vh, lw, (int)std::lround(stage_h), (double)top);
+    const int osd_id = pct <= 0.75 ? 8 : pct <= 1.25 ? 9 : pct <= 1.75 ? 10 : 11;
+    show_osd(3, osd_id);
   };
   // 键盘拖动进度状态（d29）：左右键按住 = 进度条动 + 预览，**不 seek**；抬起才提交
   bool kb_progress = false;
@@ -950,6 +1014,12 @@ int main(int argc, char** argv) {
       case GLFW_KEY_SPACE:   play_pause(); break;
       case GLFW_KEY_UP:      nudge_volume(+5); break;
       case GLFW_KEY_DOWN:    nudge_volume(-5); break;
+      // ★d322：窗口倍率缩放（PotPlayer 语义）。主键盘与小键盘同义 —— 笔记本没有小键盘，
+      // 而外接键盘用户习惯按数字区。REPEAT 已在上面被过滤（只有上下左右允许连发）。
+      case GLFW_KEY_1: case GLFW_KEY_KP_1: apply_video_scale(0.5); break;  // 50%
+      case GLFW_KEY_2: case GLFW_KEY_KP_2: apply_video_scale(1.0); break;  // 100%
+      case GLFW_KEY_3: case GLFW_KEY_KP_3: apply_video_scale(1.5); break;  // 150%
+      case GLFW_KEY_4: case GLFW_KEY_KP_4: apply_video_scale(2.0); break;  // 200%
       case GLFW_KEY_ENTER:
       case GLFW_KEY_KP_ENTER:
         if (mods & GLFW_MOD_CONTROL) {
@@ -1044,6 +1114,7 @@ int main(int argc, char** argv) {
         // d81：托盘可用 = 关闭窗口改「隐到托盘」（DMR 持续在线可继续投屏），
         // 真正退出只走托盘菜单「退出」；无托盘维持关闭即退出。
         window.hide_window();
+        pause_if_playing();   // ★d322：隐窗不再后台出声
         if (!tray_active) glfwSetWindowShouldClose(window.raw(), GLFW_TRUE);
         break;
       case UiIntent::Kind::Minimize:
@@ -1054,6 +1125,12 @@ int main(int argc, char** argv) {
           window.pos_size(&norm_x, &norm_y, &norm_w, &norm_h);  // 捕获还原矩形（拖还原跟手用）
         window.toggle_maximized();
         break;
+      case UiIntent::Kind::TogglePin: {  // ★d322：顶栏置顶钮
+        const bool next = !window.floating();
+        window.set_floating(next);
+        show_osd(3, next ? 12 : 13);   // 12 = 已置顶 / 13 = 取消置顶（见 chrome.cpp draw_osd）
+        break;
+      }
       case UiIntent::Kind::DragMove: {
         // d68 §2：拖动指令统一入口，消费与否按区域决定。目前唯一消费者 = TopBar。
         if (it.region != UiIntent::DragRegion::TopBar) break;  // Stage/Widget：已识别，无动作
@@ -1109,7 +1186,10 @@ int main(int argc, char** argv) {
           // 退出小窗：还原矩形与置顶
           pip_mode = false;
           render.set_pip(false);
-          window.set_floating(false);
+          // ★d322：置顶不能被画中画"顺手关掉"。进小窗前的真值已存在 pip_pin_before，
+          // 无条件 set_floating(false) 会把用户手动钉住的窗口放下来（有据可查的重演路径：
+          // 点置顶 → 进画中画 → 退画中画 → 置顶丢了）。
+          window.set_floating(pip_pin_before);
           window.set_pos(pip_x, pip_y);
           window.set_window_size(pip_w, pip_h);
           show_osd(3, 6);                           // d32：退出画中画反馈
@@ -1118,6 +1198,8 @@ int main(int argc, char** argv) {
           // 对全屏窗口 set_window_size 实测把整个显示器变黑（d24 用户实测）。
           // 故必须先退全屏（还原到进入前的窗口矩形），再取矩形、再缩进小窗。
           if (window.fullscreen()) window.toggle_fullscreen();
+          // ★d322：进小窗前先记下用户自己的置顶真值，退出时照它还原（见上面退出分支）
+          pip_pin_before = window.floating();
           pip_mode = true;
           render.set_pip(true);
           window.pos_size(&pip_x, &pip_y, &pip_w, &pip_h);
@@ -1259,6 +1341,7 @@ int main(int argc, char** argv) {
   auto tray_toggle_window = [&] {
     if (glfwGetWindowAttrib(window.raw(), GLFW_VISIBLE)) {
       window.hide_window();
+      pause_if_playing();   // ★d322：托盘手动隐藏同闸门（三条隐窗路径必须同语义，都是先隐后排）
     } else {
       if (glfwGetWindowAttrib(window.raw(), GLFW_ICONIFIED)) glfwRestoreWindow(window.raw());
       // d186：所在屏若已关/不可用（如关掉副屏）→ 先迁移到可用屏再显示，避免显示在黑屏上
@@ -1285,6 +1368,7 @@ int main(int argc, char** argv) {
     // Alt+F4 / 系统关机广播：托盘可用 = 隐到托盘（同关窗语义）；否则默认关闭
     if (!tray_active) return false;
     window.hide_window();
+    pause_if_playing();   // ★d322：与自绘 ✕ 同路径，避免两处语义不一致
     return true;
   };
   // d117：真退出的统一入口（托盘菜单「退出」与外部协议 tools/quit_app.py 共用）：

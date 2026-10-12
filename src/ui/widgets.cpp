@@ -503,6 +503,17 @@ void icon_skin(NVGcontext* vg, float cx, float cy, float w, NVGcolor c) {
   nvgFill(vg);
 }
 
+// ★d322：窗口轮廓（4:3 圆角方框）—— 与 icon_pip 里的"外框"同款笔法，独立出一个
+// 函数是因为它需要单独出现在 OSD 动作反馈里（OSD 不画内窗，只画窗口本身）。
+void icon_frame(NVGcontext* vg, float cx, float cy, float w, NVGcolor c) {
+  const float h = w * 0.8f;
+  nvgStrokeWidth(vg, 1.3f);
+  nvgStrokeColor(vg, c);
+  nvgBeginPath(vg);
+  nvgRoundedRect(vg, cx - w * 0.5f, cy - h * 0.5f, w, h, 1.5f);
+  nvgStroke(vg);
+}
+
 void win_button(NVGcontext* vg, const Theme& t, float x, float y, float w, float h, WinBtn kind,
                 const BtnState& st, bool active, float rad, float win_w) {
   const bool close = kind == WinBtn::Close;
@@ -537,6 +548,58 @@ void win_button(NVGcontext* vg, const Theme& t, float x, float y, float w, float
   nvgStrokeWidth(vg, t.layout.winIconStroke);
   nvgStrokeColor(vg, c);
   switch (kind) {
+    case WinBtn::Pin: {
+      // ★d322：图钉字形（第三轮）—— 只保留「扁钉帽 + 一根针」两块，其余细节全砍。
+      //   竖 = 未置顶    斜 45° = 已置顶    （参考稿实测倾角 46.3°，取整到 45°）
+      // 简化历程（每轮都是实机/栅格化验证后推翻的）：
+      //   ① 参考稿原比例：帽 512 / 颈 427 / 外扩底盘 597（1024 viewBox）⇒ 10px 下是
+      //      4.7 / 4.2 / 5.5px，差不到一个像素，实心填充后就是一个方块 + 针尖；
+      //   ② 把段间比拉到 1.00:0.44:0.84：用户实测仍认不出（还是一坨矩形）；
+      //   ③ 最终方案：只留最能代表图钉的两个特征 —— 宽扁的帽 + 居中的针（下略收）。
+      //      帽宽 0.9 vs 针宽 0.18 ⇒ 10px 下 9px vs 1.8px，结构一眼可辨，
+      //      且方头明显区别于放大镜（圆头 + 偏心杆）这一原罪。
+      static constexpr float kCap[] = {-0.45f, -0.45f, 0.45f, -0.45f, 0.45f, -0.24f,
+                                       -0.45f, -0.24f};  // 钉帽：宽 0.90 高 0.21
+      static constexpr float kNdl[] = {-0.09f, -0.24f, 0.09f, -0.24f, 0.05f, 0.48f,
+                                       -0.05f, 0.48f};   // 针：上宽 0.18 → 针尖 0.10
+      const float tilt = active ? 0.7853982f : 0.f;  // y 向下 ⇒ 正角顺时针（钉头倒向右上）
+      const float cs = std::cos(tilt), sn = std::sin(tilt);
+      auto rot = [&](float x, float y) {
+        return std::pair<float, float>{x * cs - y * sn, x * sn + y * cs};
+      };
+      // 包围盒现场算：① 斜置后外接尺寸会涨，按各自包围盒归一才能让两态外廓一样大
+      // （否则"已置顶"看着像另一个图标）；② 居中也现场算 —— 手写偏移量在改顶点时必然失配。
+      float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+      for (const float* p : {kCap, kNdl})
+        for (int i = 0; i < 8; i += 2) {
+          const auto [rx, ry] = rot(p[i], p[i + 1]);
+          x0 = std::min(x0, rx); x1 = std::max(x1, rx);
+          y0 = std::min(y0, ry); y1 = std::max(y1, ry);
+        }
+      constexpr float kFrm = 0.94f;  // 外廓占图标格的比例
+      const float k = kFrm * s / std::max(x1 - x0, y1 - y0);
+      const float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
+      nvgSave(vg);
+      nvgTranslate(vg, cx, cy);
+      nvgFillColor(vg, c);  // 两态实心同色，状态只靠倾角区分 —— 换皮肤不用加 token
+      // ⚠️ 帽 / 针必须各自独立 BeginPath+Fill。同一 Fill 塞两个子路径时，本仓库的
+      // nanovg 会把整份点列当一条多边形做扇形三角化（fan 从 0 号点连到最后），两个
+      // 部件之间的空隙全被糊满 —— 实测就是一个 9×9 的实心方块（d322 第三轮踩的坑）。
+      for (const float* p : {kCap, kNdl}) {
+        nvgBeginPath(vg);
+        for (int i = 0; i < 8; i += 2) {
+          const auto [rx, ry] = rot(p[i], p[i + 1]);
+          if (i == 0)
+            nvgMoveTo(vg, (rx - mx) * k, (ry - my) * k);
+          else
+            nvgLineTo(vg, (rx - mx) * k, (ry - my) * k);
+        }
+        nvgClosePath(vg);
+        nvgFill(vg);
+      }
+      nvgRestore(vg);
+      break;
+    }
     case WinBtn::Min:
       nvgBeginPath(vg);
       nvgMoveTo(vg, cx - s * 0.5f, cy);

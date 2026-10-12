@@ -97,10 +97,29 @@ class WindowGLFW {
   bool fullscreen() const;         // 全屏中（已绑显示器）
   void toggle_fullscreen();        // 全屏切换（保存/恢复原矩形）
   void set_floating(bool on);      // 置顶（画中画）
+  bool floating() const;           // d322：当前是否置顶（GLFW_FLOATING 回读，UI 显示真值）
   void set_window_size(int w, int h);
   void set_pos(int x, int y);
   void pos_size(int* x, int* y, int* w, int* h) const;   // 窗口坐标/尺寸（屏幕坐标）
   void move_to_workarea_corner(int w, int h);            // 工作区（避开任务栏）右下角
+
+  // —— d322：几何工具（服务于「快捷键按倍率缩放窗口」；仅主线程）——
+  // ensure_windowed：把窗口拉回「可自由设尺寸」的普通态（退最大化 → 退全屏）。
+  //   顺序不可换：最大化态下 glfwSetWindowSize 会被忽略（操作看似成功实则无效）；
+  //   全屏态窗口挂在 monitor 上，改尺寸会与 monitor 绑定打架。
+  //   画中画是**应用层**状态（main 的 pip_mode），本层没有它的真值，由调用方先处理。
+  void ensure_windowed();
+  // set_client_size_logical：按**逻辑尺寸**（DIP，与 logical_width/height 同单位）设窗口。
+  //   为什么不直接调 set_window_size：glfwSetWindowSize 的单位是「屏幕坐标」，而它在
+  //   Windows 上等于物理像素、在 X11/Wayland 上又不是（见 logical_width 实现处注释）。
+  //   这里用**现场自测系数**换算（= 1 / dip_scale()），不硬编码任何平台假设 ——
+  //   单位口径将来变了会自动跟随；系数不可得时回落 1（等同旧行为）。
+  void set_client_size_logical(int lw, int lh);
+  // center_on_workarea：把窗口按**当前尺寸**在其所在屏的工作区内居中。
+  //   尺寸用调用时实测值（Windows 会对窗口尺寸做最小/最大化更正，拿"想要的值"算会偏）。
+  //   越界保护：窗口比工作区还大时贴到工作区原点（宁可右下溢出，也不让标题栏出屏）。
+  //   Wayland 下 glfwSetWindowPos 是空操作 ⇒ 只保证尺寸、位置不动（打日志，不是错误）。
+  void center_on_workarea();
 
   // 每帧坐标
   int width() const;    // framebuffer 物理像素（FBO/GL scissor 用）

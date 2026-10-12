@@ -118,6 +118,13 @@ class MpvBridge {
   //（实测 1920x884 = 19.5:9 横屏、498x1080 = 竖屏），跟舞台比才知道该 cover 还是 contain。
   double video_aspect();
 
+  // ★d322：视频**显示尺寸**（`video-params/dw`/`dh`，已含像素宽高比 PAR 修正）。
+  // 与 video_aspect 同一口径，取不到/无视频/异常值返回 false（调用方据此跳过本次操作）。
+  // 用途：按倍率（50%/100%/150%/200%）把窗口缩放到视频原始大小 —— 传 false 时 *dw/*dh 不改写。
+  // 为什么不用 demux-w/h：那是**解码尺寸**，非方形像素（SAR≠1）的素材会算错；
+  // 为什么不用 video-out-params：那是已按当前窗口缩放过的结果，拿来算窗口尺寸 = 自我循环。
+  bool video_size(int* dw, int* dh);
+
   // —— 命令（mpv 自身线程安全；实际调用点全在主线程）——
   void load_uri(const std::string& uri, double start_sec = -1.0,
                 const std::string& load_format = {});  // R1：replace，不重建句柄

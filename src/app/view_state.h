@@ -56,6 +56,7 @@ static_assert(std::is_trivially_copyable<ViewInput>::value,
 struct UiIntent {
   enum class Kind {
     PlayPause, Prev, Next, Stop, ToggleFullscreen, ToggleMaximize, Minimize, Close, Pip,
+    TogglePin,  // d322：顶栏置顶钮（悬停位 bit18 对应的按钮；真值在主线程 pip 之外独立维护）
     Seek, Volume, Mute, Preview, DismissMenu, DragMove, ClipboardPlay, ClipboardDismiss,
     UiPrefChanged,  // R1：右键菜单勾选项变化 → 主线程落盘 settings.json
     Speed,          // d169：倍速选择（value = 倍速；主线程落盘 + 下发给播放器）

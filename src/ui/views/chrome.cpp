@@ -111,33 +111,46 @@ float chrome_fade(NVGcontext* vg, const Theme& t, float w, float h, const Playba
 void draw_win_buttons(NVGcontext* vg, const Theme& t, float w, ViewInput& in, ViewCallbacks& cb,
                       const DmgRect* clip) {
   const auto& L = t.layout;
-  for (int i = 0; i < 3; i++) {
-    const float bx = w - (3 - i) * L.winBtnW;
+  // ★d322：整组四个键。i 从左到右（0 = 最左 = 置顶），x 按"距窗口右缘第几位"算，
+  // 因此整组恒贴右缘、关闭键始终在最外侧（它的右上角要吃掉窗口圆角）。
+  for (int i = 0; i < kTopRightBtns; i++) {
+    const float bx = w - (float)(kTopRightBtns - i) * L.winBtnW;
     const bool inside = in_rect(in.mx, in.my, bx, 0, L.winBtnW, L.topBarH);
-    BtnState st = button_hit(in.btns, kBtnWinMin + i, inside, true, in.down, in.dt, t);
-    const WinBtn kind = i == 0 ? WinBtn::Min : i == 1 ? WinBtn::Max : WinBtn::Close;
+    // ButtonFx 槽位：置顶独立占 kBtnPin，三键连着占用 kBtnWinMin..Close（编号不变，
+    // regions 与 render_loop 的 busy 映射都按这套下标搬运）
+    const int slot = (i == 0) ? (int)kBtnPin : (int)kBtnWinMin + (i - 1);
+    const WinBtn kind = i == 0 ? WinBtn::Pin
+                        : i == 1 ? WinBtn::Min
+                        : i == 2 ? WinBtn::Max
+                                 : WinBtn::Close;
+    BtnState st = button_hit(in.btns, slot, inside, true, in.down, in.dt, t);
     // 只裁绘制，交互（button_hit/clicked）每帧全跑 —— 区域重绘的铁律
     if (dmg_hit(clip, bx, 0, L.winBtnW, L.topBarH)) {
       // 传 win_radius 与窗口宽：最外侧那角（关闭键的右上角）的悬停底色要跟着窗口圆角走，
       // 否则直角底色会盖住圆角、在角上露出一块方角。
+      const bool btn_active = (kind == WinBtn::Max && in.maximized) ||
+                              (kind == WinBtn::Pin && in.pinned);
       win_button(vg, t, bx, 0, L.winBtnW, L.topBarH, kind, st,
-                 kind == WinBtn::Max && in.maximized, in.win_radius, w);
+                 btn_active, in.win_radius, w);
     }
     if (!st.clicked) continue;
-    if (kind == WinBtn::Close && cb.on_close) cb.on_close();
-    if (kind == WinBtn::Min && cb.on_minimize) cb.on_minimize();
-    if (kind == WinBtn::Max && cb.on_maximize) cb.on_maximize();
+    switch (kind) {
+      case WinBtn::Close: if (cb.on_close) cb.on_close(); break;
+      case WinBtn::Min:   if (cb.on_minimize) cb.on_minimize(); break;
+      case WinBtn::Max:   if (cb.on_maximize) cb.on_maximize(); break;
+      case WinBtn::Pin:   if (cb.on_pin) cb.on_pin(); break;
+    }
   }
 }
 
-// —— d182：顶栏「皮肤按钮」几何（三键组左侧 skinBtnGap 处；绘制/命中同源）——
+// —— d182：顶栏「皮肤按钮」几何（按钮组左侧 skinBtnGap 处；绘制/命中同源）——
 SkinBtnGeom skin_button_geom(const Theme& t, float win_w) {
   const auto& L = t.layout;
   SkinBtnGeom g;
   g.w = L.skinBtnSize;
   g.h = L.topBarH;
   g.y = 0;
-  g.x = win_w - 3.f * L.winBtnW - L.skinBtnGap - g.w;
+  g.x = win_w - (float)kTopRightBtns * L.winBtnW - L.skinBtnGap - g.w;  // d322：随按钮组宽度
   return g;
 }
 
@@ -497,7 +510,8 @@ void draw_osd(NVGcontext* vg, const Theme& t, float w, float h, const PlaybackSn
     // 不再比对实时 position —— 旧逻辑 seek 完成后 position==target 恒判后退，
     // 右方向键也显示左箭头。
     // kind3 动作反馈（d32 新增）：osd_value 编码动作 id —— 1 播放 2 暂停
-    // 3 进全屏 4 退全屏 5 进画中画 6 退画中画 7 停止（d158，停止键反馈）。
+    // 3 进全屏 4 退全屏 5 进画中画 6 退画中画 7 停止（d158，停止键反馈）
+    // 8/9/10/11 = d322 窗口缩放 50%/100%/150%/200%；12/13 = d322 已置顶/取消置顶。
     const float px = L.osdEdgeGap;                                  // 贴左缘（用户定值）
     // 垂直锚点（d35）：与音量面板同顶边 = 固定顶距 osdTopGap，不随窗口高度缩放
     //（d32 曾按 h*0.25 中心/顶边换算，窗口大时面板位置漂移，用户定值废除）。
@@ -527,6 +541,14 @@ void draw_osd(NVGcontext* vg, const Theme& t, float w, float h, const PlaybackSn
         case 5: label = "画中画"; break;
         case 6: label = "退出画中画"; break;
         case 7: label = "停止"; break;
+        // ★d322：窗口按倍率缩放 —— 档位中文与投递方（main 的 apply_video_scale）一一对应，
+        // 改文案要两侧同改（数值不是这里算的，OSD 只显示倍率）
+        case 8:  label = "画面 50%"; break;
+        case 9:  label = "画面 100%"; break;
+        case 10: label = "画面 150%"; break;
+        case 11: label = "画面 200%"; break;
+        case 12: label = "已置顶"; break;
+        case 13: label = "取消置顶"; break;
         default: label = ""; break;
       }
     }
@@ -547,6 +569,8 @@ void draw_osd(NVGcontext* vg, const Theme& t, float w, float h, const PlaybackSn
       else if (id == 3 || id == 4) icon_fullscreen(vg, icon_cx, cy, L.osdActIconR * s, t.icon);
       else if (id == 5 || id == 6) icon_pip(vg, icon_cx, cy, L.osdActIconR * s, t.icon);
       else if (id == 7) icon_stop(vg, icon_cx, cy, L.osdIconR * s, t.icon);
+      // ★d322：8..13 = 窗口类动作（缩放四档 + 置顶两档）⇒ 统一用窗口轮廓
+      else if (id >= 8 && id <= 13) icon_frame(vg, icon_cx, cy, L.osdIconR * s, t.icon);
     }
 
     text(vg, t, icon_cx + icon_half + gap, cy, L.osdFont * s, t.subText, label,

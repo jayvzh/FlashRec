@@ -73,7 +73,8 @@ bool input_changed(const ViewInput& a, const ViewInput& b) {
          a.down != b.down || a.down_middle != b.down_middle ||
          a.kb_progress != b.kb_progress || a.kb_progress_value != b.kb_progress_value ||
          a.kb_preview_until != b.kb_preview_until || a.fullscreen != b.fullscreen ||
-         a.maximized != b.maximized || a.win_radius != b.win_radius ||
+         a.maximized != b.maximized || a.pinned != b.pinned ||  // d322：置顶钮外形随之变化
+         a.win_radius != b.win_radius ||
          a.osd_kind != b.osd_kind || a.osd_value != b.osd_value || a.osd_at != b.osd_at ||
          a.osd_dir != b.osd_dir ||
          a.clip_visible != b.clip_visible || a.clip_at != b.clip_at;  // d74 提示条
@@ -84,7 +85,8 @@ namespace {
 // d51：悬停语义脏判定 —— 鼠标坐标 → 悬停目标位掩码。
 // 坐标变化不再直接当重绘理由（4K 下空白处移动 = 画面零变化却整窗 20fps 重绘），
 // 升级为「悬停目标变化」：跨控件才出帧。凡是悬停会改变画面的目标各占一位：
-//   bit0-2 顶栏三键（全屏不渲染顶栏 → 无热区）  bit3-5 播放/上一集/下一集
+//   bit0-2 顶栏右侧三键（全屏不渲染顶栏 → 无热区）  bit18 顶栏置顶钮（★d322）
+//   bit3-5 播放/上一集/下一集
 //   bit6 进度条  bit7 时间文字  bit8 静音键  bit9 音量条  bit10 画中画
 //   bit11 全屏键  bit12 中央大播放键（暂停态）
 // *follow 出参 = 「坐标每动一步都要出帧」的白名单：悬停/拖拽进度条时缩略图
@@ -100,10 +102,13 @@ uint32_t hover_key_of(NVGcontext* vg, const Theme& t, float w, float h,
   const auto& L = t.layout;
   uint32_t key = 0;
   if (!fullscreen) {
-    for (int i = 0; i < 3; i++) {
-      const float bx = w - (float)(3 - i) * L.winBtnW;
+    for (int i = 0; i < kTopRightBtns; i++) {
+      const float bx = w - (float)(kTopRightBtns - i) * L.winBtnW;
       if (in.mx >= bx && in.mx < bx + L.winBtnW && in.my >= 0.f && in.my < L.topBarH)
-        key |= 1u << i;
+        // ★d322：位按**几何顺序**取（i 0..3 = 从左到右 置顶/最小化/最大化/关闭）。
+        // 前三格沿用 bit0-2；第 4 格不能用 bit3（bit3 起是底栏控件：bit3 = 播放键），
+        // 否则"悬停播放键"与"悬停第 4 个窗口钮"会撞成同一位 ⇒ 挪到空闲的 bit 18。
+        key |= 1u << (i < 3 ? i : 18);
     }
     // d182：顶栏皮肤按钮悬停（bit 17）
     const SkinBtnGeom sb = skin_button_geom(t, w);
@@ -408,6 +413,7 @@ void RenderLoop::frame(double now) {
   in.click_consumed = false;
   in.fullscreen = window_.fullscreen();
   in.maximized = window_.maximized();
+  in.pinned = window_.floating();  // d322：置顶钮外形（真值在窗口属性，不存第二份）
   in.win_radius = (in.fullscreen || in.maximized) ? 0.f : theme_.shape.windowRadius;
 
   // —— d45：右键菜单状态机（必须跑在跳帧判定**之前**：按下/弹起边沿一帧都不能漏，
@@ -576,7 +582,7 @@ void RenderLoop::frame(double now) {
         const SkinBtnGeom sb = skin_button_geom(theme_, (float)w);
         const bool on_skin_btn = in.mx >= sb.x && in.mx < sb.x + sb.w && in.my < sb.h;
         const bool top_bar = !in.fullscreen && in.my < Lay.topBarH &&
-                             in.mx < (float)w - 3.f * Lay.winBtnW && !on_skin_btn;
+                             in.mx < (float)w - kTopRightBtns * Lay.winBtnW && !on_skin_btn;
         ptr_region_ = top_bar ? PtrRegion::TopBar
                               : (hover_key != 0 ? PtrRegion::Widget : PtrRegion::Stage);
         ptr_state_ = PtrState::Pressed;
@@ -689,10 +695,10 @@ void RenderLoop::frame(double now) {
   };
   // 悬停位 → 控件矩形（与 hover_key_of 位定义一一对应，几何取自 UiRegions）
   auto add_hover_rects = [&](uint32_t key, const UiRegions& Rg, bool center_vis) {
-    for (int b = 0; b <= 17; b++) {
+    for (int b = 0; b <= 18; b++) {
       if (!(key & (1u << b))) continue;
       switch (b) {
-        case 0: case 1: case 2: dmg_add(Rg.win_btn[b]); break;
+        case 0: case 1: case 2: dmg_add(Rg.win_btn[b]); break;  // d322：几何序前三格
         case 3: dmg_add(Rg.bar_btn[kBtnPlay]); break;
         case 4: dmg_add(Rg.bar_btn[kBtnPrev]); break;
         case 5: dmg_add(Rg.bar_btn[kBtnNext]); break;
@@ -707,6 +713,7 @@ void RenderLoop::frame(double now) {
         case 13: case 14: dmg_add(Rg.prompt_bar); break;  // d74 提示条两按钮
         case 16: dmg_add(Rg.bar_btn[kBtnSpeed]); break;   // d169 倍速键
         case 17: dmg_add(Rg.skin_btn); break;             // d182 皮肤按钮
+        case 18: dmg_add(Rg.win_btn[3]); break;           // d322：几何序第 4 格（关闭钮）
         default: break;
       }
     }
@@ -725,6 +732,7 @@ void RenderLoop::frame(double now) {
 
   // —— 瞬时：窗口形态（全屏/最大化/圆角）——
   if (in.fullscreen != last_in_key_.fullscreen || in.maximized != last_in_key_.maximized ||
+      in.pinned != last_in_key_.pinned ||  // d322：置顶钮外观随状态变（低频，按整窗脏处理）
       in.win_radius != last_in_key_.win_radius)
     dmg_all(1u << 4);
   // —— 瞬时：媒体信息类快照（模式切换级，低频、保守整窗）——
@@ -838,8 +846,13 @@ void RenderLoop::frame(double now) {
   if (busy_mask) {
     for (int b = 0; b < ButtonFx::kMax; b++) {
       if (!(busy_mask & (1u << b))) continue;
-      if (b <= kBtnFullscreen) dmg_add(R.bar_btn[b]);
-      else if (b <= kBtnWinClose) dmg_add(R.win_btn[b - kBtnWinMin]);
+      // id → 矩形统一走 bar_btn（唯一来源在 regions.cpp）。★d322：三键的 win_btn 下标
+      // 因插入置顶钮而整体右移，过去这里直接写 win_btn[b - kBtnWinMin]，等于把同一套
+      // 顺序写了第二份 —— 已经错过一次。现在两侧都只读 bar_btn。
+      // kBtnPin 的 id 排在 kBtnSkin 之后，必须显式判：否则掉进最下面那条 prompt_bar
+      // 兜底，会把剪贴板提示条整条矩形标脏。
+      if (b == kBtnPin) dmg_add(R.bar_btn[kBtnPin]);
+      else if (b <= kBtnWinClose) dmg_add(R.bar_btn[b]);
       else if (b == kBtnCenterPlay) dmg_add(R.center_play);
       else if (b == kBtnSkin) dmg_add(R.skin_btn);  // d182：顶栏皮肤按钮缓动
       else dmg_add(R.prompt_bar);  // d74：kBtnClipPlay/kBtnClipIgnore（横幅内两按钮）
@@ -1120,9 +1133,9 @@ void RenderLoop::frame(double now) {
 
   // —— 空白处点击语义（单击 = 播放/暂停，双击 = 全屏）+ 中键静音 ——
   // 消歧：单击后等 dblClickSec（token，默认 300ms）；窗口内出现第二击 → 判双击，只切全屏。
-  // "空白处"由 chrome 的几何判定（bar_hit / 顶栏三键），此处不重复实现第二份几何。
+  // "空白处"由 chrome 的几何判定（bar_hit / 顶栏按钮组），此处不重复实现第二份几何。
   const bool on_winbtn =
-      in.my < theme_.layout.topBarH && in.mx >= w - 3 * theme_.layout.winBtnW;
+      in.my < theme_.layout.topBarH && in.mx >= w - kTopRightBtns * theme_.layout.winBtnW;
   // d45：菜单开着 → 底层 UI 冻结交互。给视图层传 down=false 的副本（按钮悬停仍亮、
   // 按压/点击不落——菜单面板叠在哪块按钮上，点菜单就不能误触底下的按钮）。
   // 拖拽进行中的除外：传 false 会让松手瞬间误判"拖完提交"，故保持原值。
@@ -1133,7 +1146,7 @@ void RenderLoop::frame(double now) {
   // —— v0.4.0 d57 修：隐藏按钮的冻结值清理（buttons_busy 恒真 → 60fps 死循环）——
   // d54 的 busy 收敛前提是"每个按钮每帧都被 button_hit 推进"；但**本帧不绘制的
   // 按钮没人推进**：播放/停止态的中央大播放键（只在暂停态绘制）、全屏态的顶栏
-  // 三键（顶栏整段不渲染）、画中画的全部按钮。值冻在中间态（如悬停半程 0.37）
+  // 按钮组（顶栏整段不渲染，含 d322 的置顶钮）、画中画的全部按钮。值冻在中间态（悬停半程 0.37）
   // → buttons_busy 恒真 → 60fps 恒出帧（实测 [btns] dt=0.016 连续不收敛）。
   // 隐藏 = 视觉瞬间消失、无淡出动画可停 → 每帧幂等清零（代价 0）。只清 vin：
   // 帧末存回槽后下一帧 in.btns 即干净，busy 判定一帧自愈。
@@ -1144,6 +1157,7 @@ void RenderLoop::frame(double now) {
       vin.btns.hover[kBtnWinMin] = vin.btns.hover[kBtnWinMax] = vin.btns.hover[kBtnWinClose] = 0.f;
       vin.btns.press[kBtnWinMin] = vin.btns.press[kBtnWinMax] = vin.btns.press[kBtnWinClose] = 0.f;
       vin.btns.hover[kBtnSkin] = vin.btns.press[kBtnSkin] = 0.f;  // d182：全屏无顶栏
+      vin.btns.hover[kBtnPin] = vin.btns.press[kBtnPin] = 0.f;    // d322：全屏无置顶钮
     }
     if (snap.state != TransportState::PausedPlayback) {
       vin.btns.hover[kBtnCenterPlay] = 0.f;
@@ -1793,6 +1807,7 @@ ViewCallbacks make_intent_callbacks(ViewStateChannel& ch) {
   cb.on_close = [&ch] { ch.post_intent({UiIntent::Kind::Close}); };
   cb.on_minimize = [&ch] { ch.post_intent({UiIntent::Kind::Minimize}); };
   cb.on_maximize = [&ch] { ch.post_intent({UiIntent::Kind::ToggleMaximize}); };
+  cb.on_pin = [&ch] { ch.post_intent({UiIntent::Kind::TogglePin}); };  // d322
   cb.on_fullscreen = [&ch] { ch.post_intent({UiIntent::Kind::ToggleFullscreen}); };
   cb.on_pip = [&ch] { ch.post_intent({UiIntent::Kind::Pip}); };
   cb.on_play_pause = [&ch] { ch.post_intent({UiIntent::Kind::PlayPause}); };

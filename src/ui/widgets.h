@@ -131,9 +131,16 @@ void icon_volume_muted(NVGcontext* vg, float cx, float cy, float w, NVGcolor c,
 void icon_pip(NVGcontext* vg, float cx, float cy, float w, NVGcolor c);
 void icon_fullscreen(NVGcontext* vg, float cx, float cy, float w, NVGcolor c);
 void icon_skin(NVGcontext* vg, float cx, float cy, float w, NVGcolor c);  // d182 皮肤按钮（调色盘）
-// Windows 三键（右上角方形热区；hover / press 底色 + 图标随按压轻微缩小）
-enum class WinBtn { Min, Max, Close };
+// 右上角窗口按钮（方形热区；hover / press 底色 + 图标随按压轻微缩小）
+// ★d322：WinBtn::Pin = 置顶钮（三键左侧第四个）。active 的语义按 kind 区分：
+// Max = 已最大化（画"还原"图标）；Pin = **已置顶**（字形斜置 45°，未置顶则竖直）。
+// 字形已砍到最简「扁钉帽 + 一根针」—— 参考稿的分段比例在 10px 下糊成方块，
+// 详见 widgets.cpp 里的三轮简化备注。
+// ★d322：窗口轮廓（圆角方框）。OSD 里「窗口缩放 / 置顶」两类动作反馈共用 ——
+// 二者说的都是"这个窗口本身"，复用同一个图形比各自发明一个更容易认。
+void icon_frame(NVGcontext* vg, float cx, float cy, float w, NVGcolor c);
+enum class WinBtn { Pin, Min, Max, Close };
 void win_button(NVGcontext* vg, const Theme& t, float x, float y, float w, float h, WinBtn kind,
-                const BtnState& st, bool active, float rad = 0.f, float win_w = 0.f);  // active: Max 显示"还原"图标
+                const BtnState& st, bool active, float rad = 0.f, float win_w = 0.f);
 
 }  // namespace fr

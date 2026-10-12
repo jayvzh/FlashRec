@@ -298,6 +298,13 @@ bool PlayerController::init_render(void* (*get_proc)(void* user, const char* nam
 
 VideoStats PlayerController::video_stats() { return mpv_ ? mpv_->get_video_stats() : VideoStats{}; }
 
+// ★d322：显示尺寸转发（mpv 侧同样自行门控 picture_ready 与否由调用方决定 ——
+// 这里只看有没有会话：无会话时 video-params 是上一条会话的残留值，不能拿来算窗口）。
+bool PlayerController::video_size(int* dw, int* dh) {
+  if (!mpv_ || !snap_.picture_ready) return false;
+  return mpv_->video_size(dw, dh);
+}
+
 void PlayerController::set_panscan(double p) {
   if (mpv_) mpv_->set_panscan(p);
 }

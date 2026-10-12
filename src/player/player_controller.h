@@ -39,6 +39,10 @@ class PlayerController {
   // mpv 实测视频信息整包（渲染线程 2Hz 轮询读，d44/d45；无视频各字段回 -1）
   VideoStats video_stats();
 
+  // ★d322：视频显示尺寸（含 PAR 修正）转发层。UI 侧不直接碰 mpv —— 与 video_stats
+  // 同原则。取不到（无会话/未 file-loaded/异常值）返回 false，调用方跳过本次操作。
+  bool video_size(int* dw, int* dh);
+
   // —— d124：GL 后端失败 → 软件渲染兜底（渲染线程专用，见 mpv_bridge.h）——
   // 返回 true = 本次发生了后端切换，调用方应强制重渲一帧
   bool switch_video_backend_if_needed();
